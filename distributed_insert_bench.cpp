@@ -597,12 +597,11 @@ int main(int argc, const char* argv[]) {
                     std::cout << "  recall@" << num_neighbors << "=" << recall;
                 std::cout << "\n";
             }
-            ++search_step;
         }
     }
 
     if (rank == 0)
-        std::cout << "\nDone. " << search_step << " search step(s) evaluated.\n";
+        std::cout << "\nDone.\n";
 
     MPI_Finalize();
     return 0;
