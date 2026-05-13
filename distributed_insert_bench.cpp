@@ -275,10 +275,12 @@ public:
             hnsw_params.M, hnsw_params.ef_construction, 555 + rank);
         local_hnsw->setEf(hnsw_params.ef_search);
 
-        for (uint32_t id : clusters[rank]) {
+        const auto& my_cluster = clusters[rank];
+        parlay::parallel_for(0, my_cluster.size(), [&](size_t i) {
+            uint32_t id = my_cluster[i];
             float* p = init.GetPoint(id - batch_start);
             local_hnsw->addPoint(p, id);
-        }
+        });
 
         if (rank == 0)
             std::cout << "  shard_size=" << shard_size
@@ -310,17 +312,26 @@ public:
         AllToAllV(send_ids,  recv_ids,  MPI_UINT32_T, comm_size, MPI_COMM_WORLD);
         AllToAllV(send_vecs, recv_vecs, MPI_FLOAT,    comm_size, MPI_COMM_WORLD);
 
-        for (int src = 0; src < comm_size; ++src) {
+        // Flatten received vectors; pre-resize once before parallel addPoint.
+        std::vector<uint32_t> ins_ids;
+        std::vector<float*>   ins_ptrs;
+        for (int src = 0; src < comm_size; ++src)
             for (size_t j = 0; j < recv_ids[src].size(); ++j) {
-                const uint32_t id = recv_ids[src][j];
-                float* p = recv_vecs[src].data() + j * dim;
-                if (local_hnsw->cur_element_count >= local_hnsw->max_elements_)
-                    local_hnsw->resizeIndex(
-                        local_hnsw->max_elements_ +
-                        std::max(local_hnsw->max_elements_ / 2, size_t(1)));
-                local_hnsw->addPoint(p, id);
+                ins_ids.push_back(recv_ids[src][j]);
+                ins_ptrs.push_back(recv_vecs[src].data() + j * dim);
+            }
+        {
+            const size_t incoming = ins_ids.size();
+            if (local_hnsw->cur_element_count + incoming > local_hnsw->max_elements_) {
+                size_t new_max = std::max(
+                    local_hnsw->cur_element_count + incoming,
+                    local_hnsw->max_elements_ + local_hnsw->max_elements_ / 2);
+                local_hnsw->resizeIndex(new_max);
             }
         }
+        parlay::parallel_for(0, ins_ids.size(), [&](size_t i) {
+            local_hnsw->addPoint(ins_ptrs[i], ins_ids[i]);
+        });
 
         const double elapsed = MPI_Wtime() - t0;
         double max_t = 0.0;
@@ -387,27 +398,35 @@ public:
         AllToAllV(send_qids,  recv_qids,  MPI_UINT32_T, comm_size, MPI_COMM_WORLD);
         AllToAllV(send_qvecs, recv_qvecs, MPI_FLOAT,    comm_size, MPI_COMM_WORLD);
 
-        // Search received queries; pack results to return to senders.
+        // Flatten received queries; run searchKnn in parallel; repack results.
+        struct QTask { int src; size_t j; uint32_t qid; };
+        std::vector<QTask> qtasks;
+        for (int src = 0; src < comm_size; ++src)
+            for (size_t j = 0; j < recv_qids[src].size(); ++j)
+                qtasks.push_back({src, j, recv_qids[src][j]});
+
+        using KNNResult = std::vector<std::pair<float, hnswlib::labeltype>>;
+        std::vector<KNNResult> qresults(qtasks.size());
+        parlay::parallel_for(0, qtasks.size(), [&](size_t ti) {
+            const auto& qt = qtasks[ti];
+            float* Q = recv_qvecs[qt.src].data() + qt.j * dim;
+            auto pq = local_hnsw->searchKnn(Q, num_neighbors);
+            auto& res = qresults[ti];
+            res.reserve(num_neighbors);
+            while (!pq.empty()) { res.push_back(pq.top()); pq.pop(); }
+            while ((int)res.size() < num_neighbors)
+                res.push_back({std::numeric_limits<float>::max(), 0});
+        });
+
         std::vector<std::vector<uint32_t>> snd_rqids(comm_size);
         std::vector<std::vector<uint32_t>> snd_rids(comm_size);
         std::vector<std::vector<float>>    snd_rdists(comm_size);
-        for (int src = 0; src < comm_size; ++src) {
-            const size_t nrecv = recv_qids[src].size();
-            for (size_t j = 0; j < nrecv; ++j) {
-                const uint32_t qid = recv_qids[src][j];
-                float* Q = recv_qvecs[src].data() + j * dim;
-                auto pq = local_hnsw->searchKnn(Q, num_neighbors);
-                // Collect into a vector so we can pad if needed.
-                std::vector<std::pair<float, hnswlib::labeltype>> res;
-                res.reserve(num_neighbors);
-                while (!pq.empty()) { res.push_back(pq.top()); pq.pop(); }
-                while ((int)res.size() < num_neighbors)
-                    res.push_back({std::numeric_limits<float>::max(), 0});
-                snd_rqids[src].push_back(qid);
-                for (int nn = 0; nn < num_neighbors; ++nn) {
-                    snd_rids[src].push_back((uint32_t)res[nn].second);
-                    snd_rdists[src].push_back(res[nn].first);
-                }
+        for (size_t ti = 0; ti < qtasks.size(); ++ti) {
+            const int src = qtasks[ti].src;
+            snd_rqids[src].push_back(qtasks[ti].qid);
+            for (int nn = 0; nn < num_neighbors; ++nn) {
+                snd_rids[src].push_back((uint32_t)qresults[ti][nn].second);
+                snd_rdists[src].push_back(qresults[ti][nn].first);
             }
         }
 
