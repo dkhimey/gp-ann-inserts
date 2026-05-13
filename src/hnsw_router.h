@@ -117,4 +117,12 @@ struct HNSWRouter {
         }
         return result;
     }
+
+    // Return the single closest shard for a query/insert point.
+    // Used by naive insert: route to the one nearest partition and add there.
+    int NaiveRoute(float* Q) {
+        auto result = hnsw->searchKnn(Q, 1);
+        auto [dist, point_id] = result.top();
+        return partition[point_id];
+    }
 };
