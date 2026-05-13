@@ -70,9 +70,10 @@
 
 struct Operation {
     enum class Type { INSERT, DELETE, SEARCH };
-    Type     type   = Type::SEARCH;
-    uint32_t start  = 0;
-    uint32_t end    = 0;  // exclusive
+    Type     type     = Type::SEARCH;
+    uint32_t start    = 0;
+    uint32_t end      = 0;  // exclusive
+    uint32_t step_num = 0;  // the numeric YAML key for this op (used in GT filenames)
 };
 
 struct Runbook {
@@ -126,8 +127,9 @@ static Runbook ParseRunbook(const std::string& path) {
 
             // Numeric key → new operation; commit the previous one
             if (in_op) rb.ops.push_back(cur);
-            cur   = Operation{};
-            in_op = true;
+            cur          = Operation{};
+            cur.step_num = static_cast<uint32_t>(std::stoul(key));
+            in_op        = true;
             continue;
         }
 
@@ -254,7 +256,6 @@ int main(int argc, const char* argv[]) {
     std::vector<int> routing_partition;
 
     bool index_built = false;
-    int  search_step = 0;   // 0-based GT file counter
     Timer timer;
 
     // -----------------------------------------------------------------------
@@ -392,10 +393,10 @@ int main(int argc, const char* argv[]) {
             }
 
             const std::string gt_file =
-                gt_prefix + "/step" + std::to_string(search_step) + ".gt100";
+                gt_prefix + "/step" + std::to_string(op.step_num) + ".gt100";
 
             std::cout << "[op " << op_idx + 1 << "] SEARCH"
-                      << "  step=" << search_step
+                      << "  step=" << op.step_num
                       << "  gt=" << gt_file << "\n";
 
             if (!std::filesystem::exists(gt_file)) {
@@ -422,8 +423,6 @@ int main(int argc, const char* argv[]) {
                       << "  query_time=" << qtime << " s"
                       << "  QPS=" << queries.n / qtime
                       << "  num_probes=" << num_probes_q << "\n";
-
-            ++search_step;
         }
     }
 

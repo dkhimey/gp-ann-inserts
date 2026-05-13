@@ -57,9 +57,10 @@
 
 struct Operation {
     enum class Type { INSERT, DELETE, SEARCH };
-    Type     type  = Type::SEARCH;
-    uint32_t start = 0;
-    uint32_t end   = 0;
+    Type     type     = Type::SEARCH;
+    uint32_t step_num = 0;  // original label from the runbook YAML (1-based)
+    uint32_t start    = 0;
+    uint32_t end      = 0;
 };
 
 struct Runbook {
@@ -99,7 +100,9 @@ static Runbook ParseRunbook(const std::string& path) {
             if (key.empty() || !std::all_of(key.begin(), key.end(), ::isdigit))
                 continue;
             if (in_op) rb.ops.push_back(cur);
-            cur = Operation{}; in_op = true; continue;
+            cur = Operation{};
+            cur.step_num = static_cast<uint32_t>(std::stoul(key));
+            in_op = true; continue;
         }
         if (!in_op) continue;
         if (sw(line, "    operation:")) {
@@ -526,7 +529,6 @@ int main(int argc, const char* argv[]) {
     bench.num_voting_neighbors = 10;
 
     bool index_built = false;
-    int  search_step = 0;
 
     for (size_t op_idx = 0; op_idx < rb.ops.size(); ++op_idx) {
         const Operation& op = rb.ops[op_idx];
@@ -581,10 +583,9 @@ int main(int argc, const char* argv[]) {
         else {  // SEARCH
             if (!index_built) continue;
             const std::string gt_file =
-                gt_prefix + "/step" + std::to_string(search_step) + ".gt100";
+                gt_prefix + "/step" + std::to_string(op.step_num) + ".gt100";
             if (rank == 0)
-                std::cout << "[op " << op_idx+1 << "] SEARCH"
-                          << "  step=" << search_step
+                std::cout << "[op " << op.step_num << "] SEARCH"
                           << "  gt=" << gt_file << "\n";
             if (rank != 0) std::cout.setstate(std::ios_base::failbit);
             auto [t, recall] = bench.ProcessSearch(queries, gt_file);
