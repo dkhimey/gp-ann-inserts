@@ -401,7 +401,6 @@ int main(int argc, const char* argv[]) {
 
             if (!std::filesystem::exists(gt_file)) {
                 std::cout << "  GT file not found — skipping recall.\n";
-                ++search_step;
                 continue;
             }
 
@@ -426,6 +425,6 @@ int main(int argc, const char* argv[]) {
         }
     }
 
-    std::cout << "\nDone. " << search_step << " search step(s) evaluated.\n";
+    std::cout << "\nDone.\n";
     return 0;
 }
