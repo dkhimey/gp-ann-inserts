@@ -196,6 +196,23 @@ public:
     int num_probes         = 1;
     int num_voting_neighbors = 10;
 
+    // Gather cur_element_count from every rank into a vector on rank 0.
+    // Returns an empty vector on non-root ranks.
+    std::vector<size_t> GatherShardSizes() const {
+        const size_t local_count = local_hnsw ? local_hnsw->cur_element_count : 0;
+        // Use unsigned long long for portability across MPI implementations.
+        const unsigned long long my_val = static_cast<unsigned long long>(local_count);
+        std::vector<unsigned long long> all_vals(comm_size, 0);
+        MPI_Gather(&my_val, 1, MPI_UNSIGNED_LONG_LONG,
+                   all_vals.data(), 1, MPI_UNSIGNED_LONG_LONG,
+                   0, MPI_COMM_WORLD);
+        if (rank != 0) return {};
+        std::vector<size_t> result(comm_size);
+        for (int r = 0; r < comm_size; ++r)
+            result[r] = static_cast<size_t>(all_vals[r]);
+        return result;
+    }
+
     HNSWParameters hnsw_params{ .M=16, .ef_construction=200, .ef_search=120 };
 
     // Router — built identically on all ranks (deterministic training).
@@ -505,13 +522,13 @@ int main(int argc, const char* argv[]) {
     // Suppress ReadPoints stdout chatter on non-root ranks.
     if (rank != 0) std::cout.setstate(std::ios_base::failbit);
 
-    if (argc < 7 || argc > 8) {
+    if (argc < 7 || argc > 9) {
         if (rank == 0)
             std::cerr <<
                 "Usage: mpirun -np <K> ./DistributedInsertBench"
                 " <base.fbin> <queries.fbin> <partition-file>"
                 " <gt-prefix> <runbook.yaml>"
-                " <num-neighbors> [num-probes-query]\n";
+                " <num-neighbors> [num-probes-query] [output-file]\n";
         MPI_Finalize(); return 1;
     }
 
@@ -521,7 +538,8 @@ int main(int argc, const char* argv[]) {
     const std::string gt_prefix      = argv[4];
     const std::string runbook_path   = argv[5];
     const int         num_neighbors  = std::stoi(argv[6]);
-    const int         num_probes_q   = (argc == 8) ? std::stoi(argv[7]) : 1;
+    const int         num_probes_q   = (argc >= 8) ? std::stoi(argv[7]) : 1;
+    const std::string output_file    = (argc == 9) ? argv[8] : "distributed_insert_bench_results.csv";
 
     // Re-enable rank-0 output after suppression was set.
     if (rank == 0) std::cout.clear();
@@ -532,7 +550,24 @@ int main(int argc, const char* argv[]) {
     if (rank == 0)
         std::cout << "Dataset : " << rb.dataset_name << "\n"
                   << "max_pts : " << rb.max_pts << "\n"
-                  << "ops     : " << rb.ops.size() << "\n\n";
+                  << "ops     : " << rb.ops.size() << "\n"
+                  << "output  : " << output_file   << "\n\n";
+
+    // Open CSV output file on rank 0.
+    std::ofstream csv;
+    if (rank == 0) {
+        csv.open(output_file);
+        if (!csv) {
+            std::cerr << "Cannot open output file: " << output_file << "\n";
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        // Header: fixed columns first, then one column per shard.
+        csv << "step,operation,range_start,range_end,time_s,throughput,recall@"
+            << num_neighbors;
+        for (int r = 0; r < comm_size; ++r)
+            csv << ",shard_" << r << "_size";
+        csv << "\n";
+    }
 
     // Suppress again for ReadPoints calls.
     if (rank != 0) std::cout.setstate(std::ios_base::failbit);
@@ -571,9 +606,27 @@ int main(int argc, const char* argv[]) {
                                    op.start, op.end);
                 if (rank == 0) std::cout.clear();
                 MPI_Barrier(MPI_COMM_WORLD);
+                const double build_t = MPI_Wtime() - t0;
+                const double build_tp = (build_t > 0)
+                    ? (double)(op.end - op.start) / build_t : 0.0;
                 if (rank == 0)
-                    std::cout << "  build_time=" << MPI_Wtime()-t0 << " s\n";
+                    std::cout << "  build_time=" << build_t << " s\n";
                 index_built = true;
+
+                // Write BUILD row.
+                if (rank == 0) {
+                    auto shard_sizes = bench.GatherShardSizes();
+                    csv << op.step_num << ",BUILD,"
+                        << op.start << "," << op.end << ","
+                        << build_t << "," << build_tp << ",";
+                    // No recall for build.
+                    csv << "N/A";
+                    for (auto sz : shard_sizes) csv << "," << sz;
+                    csv << "\n";
+                    csv.flush();
+                } else {
+                    bench.GatherShardSizes(); // non-root must still participate
+                }
 
             } else {
                 if (rank == 0)
@@ -583,9 +636,22 @@ int main(int argc, const char* argv[]) {
                 if (rank != 0) std::cout.setstate(std::ios_base::failbit);
                 const double t = bench.ProcessInserts(point_file, op.start, op.end);
                 if (rank == 0) std::cout.clear();
+                const double tp = (t > 0) ? (double)(op.end - op.start) / t : 0.0;
                 if (rank == 0)
                     std::cout << "  insert_time=" << t << " s"
-                              << "  throughput=" << (op.end-op.start)/t << " vec/s\n";
+                              << "  throughput=" << tp << " vec/s\n";
+
+                if (rank == 0) {
+                    auto shard_sizes = bench.GatherShardSizes();
+                    csv << op.step_num << ",INSERT,"
+                        << op.start << "," << op.end << ","
+                        << t << "," << tp << ",N/A";
+                    for (auto sz : shard_sizes) csv << "," << sz;
+                    csv << "\n";
+                    csv.flush();
+                } else {
+                    bench.GatherShardSizes();
+                }
             }
         }
 
@@ -596,9 +662,22 @@ int main(int argc, const char* argv[]) {
                           << "  base[" << op.start << "," << op.end << ")"
                           << "  (" << op.end-op.start << " vectors)\n";
             const double t = bench.ProcessDeletes(op.start, op.end);
+            const double tp = (t > 0) ? (double)(op.end - op.start) / t : 0.0;
             if (rank == 0)
                 std::cout << "  delete_time=" << t << " s"
-                          << "  throughput=" << (op.end-op.start)/t << " vec/s\n";
+                          << "  throughput=" << tp << " vec/s\n";
+
+            if (rank == 0) {
+                auto shard_sizes = bench.GatherShardSizes();
+                csv << op.step_num << ",DELETE,"
+                    << op.start << "," << op.end << ","
+                    << t << "," << tp << ",N/A";
+                for (auto sz : shard_sizes) csv << "," << sz;
+                csv << "\n";
+                csv.flush();
+            } else {
+                bench.GatherShardSizes();
+            }
         }
 
         else {  // SEARCH
@@ -611,18 +690,35 @@ int main(int argc, const char* argv[]) {
             if (rank != 0) std::cout.setstate(std::ios_base::failbit);
             auto [t, recall] = bench.ProcessSearch(queries, gt_file);
             if (rank == 0) std::cout.clear();
+            const double qps = (t > 0) ? (double)queries.n / t : 0.0;
+            const bool has_gt = std::filesystem::exists(gt_file);
             if (rank == 0) {
                 std::cout << "  query_time=" << t << " s"
-                          << "  QPS=" << queries.n / t;
-                if (std::filesystem::exists(gt_file))
+                          << "  QPS=" << qps;
+                if (has_gt)
                     std::cout << "  recall@" << num_neighbors << "=" << recall;
                 std::cout << "\n";
+            }
+
+            if (rank == 0) {
+                auto shard_sizes = bench.GatherShardSizes();
+                csv << op.step_num << ",SEARCH,"
+                    << 0 << "," << queries.n << ","
+                    << t << "," << qps << ",";
+                if (has_gt) csv << recall; else csv << "N/A";
+                for (auto sz : shard_sizes) csv << "," << sz;
+                csv << "\n";
+                csv.flush();
+            } else {
+                bench.GatherShardSizes();
             }
         }
     }
 
-    if (rank == 0)
-        std::cout << "\nDone.\n";
+    if (rank == 0) {
+        std::cout << "\nDone.  Results written to " << output_file << "\n";
+        csv.close();
+    }
 
     MPI_Finalize();
     return 0;
