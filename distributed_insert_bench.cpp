@@ -199,7 +199,7 @@ public:
     // Gather cur_element_count from every rank into a vector on rank 0.
     // Returns an empty vector on non-root ranks.
     std::vector<size_t> GatherShardSizes() const {
-        const size_t local_count = local_hnsw ? local_hnsw->cur_element_count : 0;
+        const size_t local_count = local_hnsw ? local_hnsw->cur_element_count.load() : 0;
         // Use unsigned long long for portability across MPI implementations.
         const unsigned long long my_val = static_cast<unsigned long long>(local_count);
         std::vector<unsigned long long> all_vals(comm_size, 0);
