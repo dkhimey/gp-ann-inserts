@@ -366,10 +366,23 @@ public:
     // -----------------------------------------------------------------------
     // Returns max elapsed time across ranks (timed section: Alltoallv + markDelete).
     double ProcessDeletes(uint32_t start, uint32_t end) {
+        // Collect all IDs in the range that are currently live.  We need this
+        // full list on every rank so that ALL ranks can erase those IDs from
+        // label_to_shard after the operation, keeping the map consistent.
+        // (label_to_shard is identical on every rank; a delete must be reflected
+        //  everywhere, not just on the owning shard.)
+        std::vector<uint32_t> all_delete_ids;
         std::vector<std::vector<uint32_t>> send_labels(comm_size);
         for (uint32_t id = start; id < end; ++id) {
             auto it = label_to_shard.find(id);
-            if (it != label_to_shard.end()) send_labels[it->second].push_back(id);
+            if (it == label_to_shard.end()) continue;
+            all_delete_ids.push_back(id);
+            // Mirror the ProcessInserts deduplication: only one rank sends each
+            // label so the owning shard receives exactly one markDelete per ID.
+            // Without this guard every rank sends every label and the shard gets
+            // comm_size copies, causing markDelete to throw on the second call.
+            if ((int)(id % (uint32_t)comm_size) == rank)
+                send_labels[it->second].push_back(id);
         }
 
         MPI_Barrier(MPI_COMM_WORLD);
@@ -379,10 +392,15 @@ public:
         AllToAllV(send_labels, recv_labels, MPI_UINT32_T, comm_size, MPI_COMM_WORLD);
 
         for (int src = 0; src < comm_size; ++src)
-            for (uint32_t id : recv_labels[src]) {
+            for (uint32_t id : recv_labels[src])
                 local_hnsw->markDelete(id);
-                label_to_shard.erase(id);
-            }
+
+        // All ranks must erase every deleted ID from label_to_shard so the map
+        // stays consistent.  Previously only the owning rank erased its received
+        // labels, leaving stale entries on every other rank and causing crashes
+        // if those IDs appeared in any future delete range.
+        for (uint32_t id : all_delete_ids)
+            label_to_shard.erase(id);
 
         const double elapsed = MPI_Wtime() - t0;
         double max_t = 0.0;
