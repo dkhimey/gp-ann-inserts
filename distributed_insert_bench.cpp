@@ -38,6 +38,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <parlay/primitives.h>
@@ -210,10 +211,10 @@ public:
 #endif
     std::unique_ptr<hnswlib::HierarchicalNSW<float>> local_hnsw;
 
-    // label_to_shard[id]: which rank owns global_id (-1 = not inserted).
+    // label_to_shard[id]: which rank owns global_id (absent = not inserted).
     // Consistent on ALL ranks because all ranks read and route each insert
     // batch before distributing it.
-    std::vector<int32_t> label_to_shard;
+    std::unordered_map<uint32_t, int32_t> label_to_shard;
 
     DistributedInsertBenchmark() {
         MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -233,7 +234,8 @@ public:
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
 
-        label_to_shard.assign(max_pts, -1);
+        label_to_shard.clear();
+        label_to_shard.reserve(max_pts);
         for (int r = 0; r < comm_size; ++r)
             for (uint32_t id : clusters[r])
                 label_to_shard[id] = r;
@@ -344,8 +346,8 @@ public:
     double ProcessDeletes(uint32_t start, uint32_t end) {
         std::vector<std::vector<uint32_t>> send_labels(comm_size);
         for (uint32_t id = start; id < end; ++id) {
-            const int32_t t = (id < label_to_shard.size()) ? label_to_shard[id] : -1;
-            if (t >= 0) send_labels[t].push_back(id);
+            auto it = label_to_shard.find(id);
+            if (it != label_to_shard.end()) send_labels[it->second].push_back(id);
         }
 
         MPI_Barrier(MPI_COMM_WORLD);
@@ -357,7 +359,7 @@ public:
         for (int src = 0; src < comm_size; ++src)
             for (uint32_t id : recv_labels[src]) {
                 local_hnsw->markDelete(id);
-                label_to_shard[id] = -1;
+                label_to_shard.erase(id);
             }
 
         const double elapsed = MPI_Wtime() - t0;
