@@ -319,8 +319,13 @@ public:
             float* p = batch.GetPoint(i);
             const int t = router->NaiveRoute(p);
             label_to_shard[gid] = t;
-            send_ids[t].push_back(gid);
-            send_vecs[t].insert(send_vecs[t].end(), p, p + dim);
+            // All ranks read every vector so label_to_shard stays consistent,
+            // but only one rank sends each vector to avoid comm_size-fold
+            // duplication on the target shard.
+            if ((int)(i % comm_size) == rank) {
+                send_ids[t].push_back(gid);
+                send_vecs[t].insert(send_vecs[t].end(), p, p + dim);
+            }
         }
 
         MPI_Barrier(MPI_COMM_WORLD);
