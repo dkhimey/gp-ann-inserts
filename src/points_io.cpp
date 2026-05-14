@@ -4,9 +4,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <fcntl.h>
-#include <unistd.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
 
 #include "defs.h"
 
@@ -143,34 +141,27 @@ PointSet ReadPointsMmap(const std::string& path) {
         throw std::runtime_error("ReadPointsMmap only supports .fbin files");
     }
 
-    int fd = open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
-        throw std::runtime_error("ReadPointsMmap: cannot open " + path);
-    }
-
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-        close(fd);
-        throw std::runtime_error("ReadPointsMmap: fstat failed for " + path);
-    }
-    size_t file_size = static_cast<size_t>(st.st_size);
-
-    // Read the header (n, d) directly.
+    // Read header with ifstream — identical to what ReadPoints does, so we
+    // know this works regardless of platform quirks with raw ::read().
     uint32_t n = 0, d = 0;
-    if (::read(fd, &n, sizeof(uint32_t)) != sizeof(uint32_t) ||
-        ::read(fd, &d, sizeof(uint32_t)) != sizeof(uint32_t)) {
-        close(fd);
-        throw std::runtime_error("ReadPointsMmap: failed to read header from " + path);
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) throw std::runtime_error("ReadPointsMmap: cannot open " + path);
+        in.read(reinterpret_cast<char*>(&n), sizeof(uint32_t));
+        in.read(reinterpret_cast<char*>(&d), sizeof(uint32_t));
+        if (!in) throw std::runtime_error("ReadPointsMmap: failed to read header from " + path);
     }
 
-    std::cout << "ReadPointsMmap: n=" << n << " d=" << d
-              << " file_size=" << file_size << std::endl;
+    std::cout << "ReadPointsMmap: n=" << n << " d=" << d << std::endl;
 
     const size_t header_bytes = 2 * sizeof(uint32_t);
-    const size_t expected_data_bytes = static_cast<size_t>(n) * d * sizeof(float);
-    if (file_size < header_bytes + expected_data_bytes) {
-        close(fd);
-        throw std::runtime_error("ReadPointsMmap: file too small for declared n*d");
+    const size_t data_bytes   = static_cast<size_t>(n) * d * sizeof(float);
+    const size_t file_size    = header_bytes + data_bytes;
+
+    // Open a separate fd for mmap.
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        throw std::runtime_error("ReadPointsMmap: open() for mmap failed on " + path);
     }
 
     // Map the entire file read-only.
