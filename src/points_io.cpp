@@ -136,57 +136,82 @@ void WritePoints(PointSet& points, const std::string& path) {
 }
 
 
+// Shared helper: mmap any bin file and set up the PointSet.
+// is_float=true  → .fbin  (float32 data, mmap_coords set)
+// is_float=false → .u8bin (uint8  data, mmap_u8 set)
+static PointSet MmapFile(const std::string& path, bool is_float) {
+    // --- Step 1: read n and d with ifstream (same as ReadPoints, known good) ---
+    uint32_t n = 0, d = 0;
+    std::cout << "MmapFile: opening " << path << std::endl;
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            throw std::runtime_error("MmapFile: cannot open '" + path + "' (errno " +
+                                     std::to_string(errno) + ": " + strerror(errno) + ")");
+        }
+        in.read(reinterpret_cast<char*>(&n), sizeof(uint32_t));
+        in.read(reinterpret_cast<char*>(&d), sizeof(uint32_t));
+        if (!in) {
+            throw std::runtime_error("MmapFile: read header failed for '" + path +
+                                     "' gcount=" + std::to_string(in.gcount()) +
+                                     " rdstate=0x" + std::to_string(in.rdstate()) +
+                                     " errno=" + std::to_string(errno));
+        }
+    }
+    std::cout << "MmapFile: n=" << n << " d=" << d << std::endl;
+
+    // --- Step 2: compute file size and mmap ---
+    const size_t header_bytes = 2 * sizeof(uint32_t);
+    const size_t elem_bytes   = is_float ? sizeof(float) : sizeof(uint8_t);
+    const size_t data_bytes   = static_cast<size_t>(n) * d * elem_bytes;
+    const size_t file_size    = header_bytes + data_bytes;
+
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        throw std::runtime_error("MmapFile: open() failed for mmap on '" + path +
+                                 "' (errno " + std::to_string(errno) + ")");
+    }
+
+    void* base = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    int saved_errno = errno;
+    close(fd);
+    if (base == MAP_FAILED) {
+        throw std::runtime_error("MmapFile: mmap failed for '" + path +
+                                 "' size=" + std::to_string(file_size) +
+                                 " (errno " + std::to_string(saved_errno) + ")");
+    }
+
+    madvise(base, file_size, MADV_WILLNEED);
+
+    // --- Step 3: build PointSet ---
+    PointSet points;
+    points.n         = n;
+    points.d         = d;
+    points.mmap_base = base;
+    points.mmap_size = file_size;
+
+    char* data_start = static_cast<char*>(base) + header_bytes;
+    if (is_float) {
+        points.mmap_coords = reinterpret_cast<float*>(data_start);
+    } else {
+        points.mmap_u8 = reinterpret_cast<uint8_t*>(data_start);
+    }
+
+    return points;
+}
+
+PointSet ReadU8BinMmap(const std::string& path) {
+    if (!path.ends_with(".u8bin")) {
+        throw std::runtime_error("ReadU8BinMmap only supports .u8bin files");
+    }
+    return MmapFile(path, /*is_float=*/false);
+}
+
 PointSet ReadPointsMmap(const std::string& path) {
     if (!path.ends_with(".fbin")) {
         throw std::runtime_error("ReadPointsMmap only supports .fbin files");
     }
-
-    // Read header with ifstream — identical to what ReadPoints does, so we
-    // know this works regardless of platform quirks with raw ::read().
-    uint32_t n = 0, d = 0;
-    {
-        std::ifstream in(path, std::ios::binary);
-        if (!in) throw std::runtime_error("ReadPointsMmap: cannot open " + path);
-        in.read(reinterpret_cast<char*>(&n), sizeof(uint32_t));
-        in.read(reinterpret_cast<char*>(&d), sizeof(uint32_t));
-        if (!in) throw std::runtime_error("ReadPointsMmap: failed to read header from " + path);
-    }
-
-    std::cout << "ReadPointsMmap: n=" << n << " d=" << d << std::endl;
-
-    const size_t header_bytes = 2 * sizeof(uint32_t);
-    const size_t data_bytes   = static_cast<size_t>(n) * d * sizeof(float);
-    const size_t file_size    = header_bytes + data_bytes;
-
-    // Open a separate fd for mmap.
-    int fd = open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
-        throw std::runtime_error("ReadPointsMmap: open() for mmap failed on " + path);
-    }
-
-    // Map the entire file read-only.
-    void* base = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (base == MAP_FAILED) {
-        throw std::runtime_error("ReadPointsMmap: mmap failed for " + path);
-    }
-
-    // GP sketching scans points roughly in order (iota ids at depth 0),
-    // then BruteForceBuckets re-reads them in bucket order (more random).
-    // MADV_SEQUENTIAL would hurt the random phase, so use MADV_WILLNEED to
-    // encourage the kernel to read-ahead without locking in a strictly sequential
-    // eviction policy.  On Linux this starts background I/O immediately for the
-    // whole file; remove it if you want purely on-demand paging.
-    madvise(base, file_size, MADV_WILLNEED);
-
-    PointSet points;
-    points.n          = n;
-    points.d          = d;
-    points.mmap_base  = base;
-    points.mmap_size  = file_size;
-    points.mmap_coords = reinterpret_cast<float*>(static_cast<char*>(base) + header_bytes);
-
-    return points;
+    return MmapFile(path, /*is_float=*/true);
 }
 
 std::vector<NNVec> ReadGroundTruth(const std::string& path) {

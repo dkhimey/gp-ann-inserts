@@ -9,19 +9,28 @@
 #include "topn.h"
 
 struct PointSet {
-  std::vector<float> coordinates;   // potentially empty (unused when mmap-backed)
+  std::vector<float> coordinates;   // heap-backed (unused when mmap-backed)
 
-  // mmap backing — set by ReadPointsMmap(), null otherwise.
-  // mmap_base/mmap_size are the raw mmap region (needed for munmap).
-  // mmap_coords points into that region at the start of the float data.
-  void*  mmap_base  = nullptr;
-  size_t mmap_size  = 0;
-  float* mmap_coords = nullptr;
+  // mmap backing — set by ReadPointsMmap() / ReadU8BinMmap(), null otherwise.
+  void*    mmap_base    = nullptr;  // base address passed to munmap()
+  size_t   mmap_size    = 0;        // byte length passed to munmap()
+  float*   mmap_coords  = nullptr;  // float data start (for .fbin)
+  uint8_t* mmap_u8      = nullptr;  // uint8 data start (for .u8bin)
 
   size_t d = 0, n = 0;
 
   float* GetPoint(size_t i) {
-    return mmap_coords ? mmap_coords + i * d : &coordinates[i * d];
+    if (mmap_coords) return mmap_coords + i * d;
+    if (mmap_u8) {
+      // Convert uint8 → float on the fly into a per-thread scratch buffer.
+      // Safe for parallel access: each thread has its own buffer.
+      thread_local std::vector<float> buf;
+      if (buf.size() < d) buf.resize(d);
+      const uint8_t* src = mmap_u8 + i * d;
+      for (size_t j = 0; j < d; ++j) buf[j] = static_cast<float>(src[j]);
+      return buf.data();
+    }
+    return &coordinates[i * d];
   }
 
   void Drop() {
@@ -30,6 +39,7 @@ struct PointSet {
       munmap(mmap_base, mmap_size);
       mmap_base   = nullptr;
       mmap_coords = nullptr;
+      mmap_u8     = nullptr;
       mmap_size   = 0;
     }
   }

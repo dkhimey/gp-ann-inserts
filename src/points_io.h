@@ -9,6 +9,10 @@ PointSet ReadPoints(const std::string& path, int64_t size = -1);
 // Only supported for .fbin files (raw float32).
 PointSet ReadPointsMmap(const std::string& path);
 
+// Same but for .u8bin files. uint8 values are converted to float on the fly
+// in GetPoint() via a per-thread scratch buffer.
+PointSet ReadU8BinMmap(const std::string& path);
+
 void WritePoints(PointSet& points, const std::string& path);
 
 std::vector<NNVec> ReadGroundTruth(const std::string& path);
