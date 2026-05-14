@@ -1,6 +1,7 @@
 #include "points_io.h"
 
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <stdexcept>
 #include <fcntl.h>
