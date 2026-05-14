@@ -2,6 +2,11 @@
 
 #include <cstdint>
 #include <fstream>
+#include <stdexcept>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 #include "defs.h"
 
@@ -132,6 +137,66 @@ void WritePoints(PointSet& points, const std::string& path) {
     out.write(reinterpret_cast<const char*>(&points.coordinates[0]), points.coordinates.size() * sizeof(float));
 }
 
+
+PointSet ReadPointsMmap(const std::string& path) {
+    if (!path.ends_with(".fbin")) {
+        throw std::runtime_error("ReadPointsMmap only supports .fbin files");
+    }
+
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        throw std::runtime_error("ReadPointsMmap: cannot open " + path);
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        throw std::runtime_error("ReadPointsMmap: fstat failed for " + path);
+    }
+    size_t file_size = static_cast<size_t>(st.st_size);
+
+    // Read the header (n, d) directly.
+    uint32_t n = 0, d = 0;
+    if (::read(fd, &n, sizeof(uint32_t)) != sizeof(uint32_t) ||
+        ::read(fd, &d, sizeof(uint32_t)) != sizeof(uint32_t)) {
+        close(fd);
+        throw std::runtime_error("ReadPointsMmap: failed to read header from " + path);
+    }
+
+    std::cout << "ReadPointsMmap: n=" << n << " d=" << d
+              << " file_size=" << file_size << std::endl;
+
+    const size_t header_bytes = 2 * sizeof(uint32_t);
+    const size_t expected_data_bytes = static_cast<size_t>(n) * d * sizeof(float);
+    if (file_size < header_bytes + expected_data_bytes) {
+        close(fd);
+        throw std::runtime_error("ReadPointsMmap: file too small for declared n*d");
+    }
+
+    // Map the entire file read-only.
+    void* base = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (base == MAP_FAILED) {
+        throw std::runtime_error("ReadPointsMmap: mmap failed for " + path);
+    }
+
+    // GP sketching scans points roughly in order (iota ids at depth 0),
+    // then BruteForceBuckets re-reads them in bucket order (more random).
+    // MADV_SEQUENTIAL would hurt the random phase, so use MADV_WILLNEED to
+    // encourage the kernel to read-ahead without locking in a strictly sequential
+    // eviction policy.  On Linux this starts background I/O immediately for the
+    // whole file; remove it if you want purely on-demand paging.
+    madvise(base, file_size, MADV_WILLNEED);
+
+    PointSet points;
+    points.n          = n;
+    points.d          = d;
+    points.mmap_base  = base;
+    points.mmap_size  = file_size;
+    points.mmap_coords = reinterpret_cast<float*>(static_cast<char*>(base) + header_bytes);
+
+    return points;
+}
 
 std::vector<NNVec> ReadGroundTruth(const std::string& path) {
     uint32_t num_queries = 0;

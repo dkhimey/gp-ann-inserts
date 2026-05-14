@@ -4,20 +4,44 @@
 #include <cstdint>
 #include <chrono>
 #include <algorithm>
+#include <sys/mman.h>
 
 #include "topn.h"
 
 struct PointSet {
-  std::vector<float> coordinates;   // potentially empty
+  std::vector<float> coordinates;   // potentially empty (unused when mmap-backed)
+
+  // mmap backing — set by ReadPointsMmap(), null otherwise.
+  // mmap_base/mmap_size are the raw mmap region (needed for munmap).
+  // mmap_coords points into that region at the start of the float data.
+  void*  mmap_base  = nullptr;
+  size_t mmap_size  = 0;
+  float* mmap_coords = nullptr;
+
   size_t d = 0, n = 0;
-  float* GetPoint(size_t i) { return &coordinates[i*d]; }
-  void Drop() { coordinates.clear(); coordinates.shrink_to_fit(); }
+
+  float* GetPoint(size_t i) {
+    return mmap_coords ? mmap_coords + i * d : &coordinates[i * d];
+  }
+
+  void Drop() {
+    coordinates.clear(); coordinates.shrink_to_fit();
+    if (mmap_base) {
+      munmap(mmap_base, mmap_size);
+      mmap_base   = nullptr;
+      mmap_coords = nullptr;
+      mmap_size   = 0;
+    }
+  }
+
   void Alloc() { coordinates.resize(n*d, 0.f); }
   void Resize(size_t _n) {
       n = _n;
       coordinates.resize(_n * d);
   }
   bool empty() const { return n == 0; }
+
+  ~PointSet() { Drop(); }
 };
 
 PointSet ExtractPointsInBucket(const std::vector<uint32_t>& bucket, PointSet& points);

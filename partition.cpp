@@ -78,7 +78,12 @@ int main(int argc, const char* argv[]) {
         return 0;
     }
 
-    PointSet points = ReadPoints(input_file);
+    // Use memory-mapped I/O for .fbin files so the OS pages data in on demand.
+    // This avoids a single huge malloc that fails when n*d*4 bytes don't fit in RAM.
+    // For other formats fall back to the ordinary (fully-loaded) reader.
+    PointSet points = input_file.ends_with(".fbin")
+        ? ReadPointsMmap(input_file)
+        : ReadPoints(input_file);
     std::cout << "Finished reading points" << std::endl;
 
     if (part_method == "GP" && overlap != 0.0) {
