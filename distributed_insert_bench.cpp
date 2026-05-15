@@ -194,7 +194,7 @@ public:
     int rank = 0, comm_size = 1, num_shards = 1, dim = 0;
     int num_neighbors      = 10;
     int num_probes         = 1;
-    int num_voting_neighbors = 50;
+    int num_voting_neighbors = 10;
 
     // Gather cur_element_count from every rank into a vector on rank 0.
     // Returns an empty vector on non-root ranks.
@@ -618,7 +618,7 @@ int main(int argc, const char* argv[]) {
     DistributedInsertBenchmark bench;
     bench.num_neighbors       = num_neighbors;
     bench.num_probes          = num_probes_q;
-    bench.num_voting_neighbors = 50;
+    bench.num_voting_neighbors = 10;
 
     bool index_built = false;
 
