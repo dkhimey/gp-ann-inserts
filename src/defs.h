@@ -4,20 +4,86 @@
 #include <cstdint>
 #include <chrono>
 #include <algorithm>
+#include <sys/mman.h>
 
 #include "topn.h"
 
 struct PointSet {
-  std::vector<float> coordinates;   // potentially empty
+  std::vector<float> coordinates;   // heap-backed (unused when mmap-backed)
+
+  // mmap backing — set by ReadPointsMmap() / ReadU8BinMmap(), null otherwise.
+  void*    mmap_base    = nullptr;  // base address passed to munmap()
+  size_t   mmap_size    = 0;        // byte length passed to munmap()
+  float*   mmap_coords  = nullptr;  // float data start (for .fbin)
+  uint8_t* mmap_u8      = nullptr;  // uint8 data start (for .u8bin)
+
   size_t d = 0, n = 0;
-  float* GetPoint(size_t i) { return &coordinates[i*d]; }
-  void Drop() { coordinates.clear(); coordinates.shrink_to_fit(); }
+
+  // Default and heap-backed construction is fine.
+  PointSet() = default;
+
+  // Move constructor: transfer mmap ownership, zero out the source.
+  PointSet(PointSet&& other) noexcept
+      : coordinates(std::move(other.coordinates)),
+        mmap_base(other.mmap_base), mmap_size(other.mmap_size),
+        mmap_coords(other.mmap_coords), mmap_u8(other.mmap_u8),
+        d(other.d), n(other.n) {
+    other.mmap_base = nullptr; other.mmap_coords = nullptr;
+    other.mmap_u8   = nullptr; other.mmap_size   = 0;
+  }
+
+  // Move assignment: release own resources, then steal from other.
+  PointSet& operator=(PointSet&& other) noexcept {
+    if (this != &other) {
+      Drop();
+      coordinates  = std::move(other.coordinates);
+      mmap_base    = other.mmap_base;   mmap_size   = other.mmap_size;
+      mmap_coords  = other.mmap_coords; mmap_u8     = other.mmap_u8;
+      d = other.d; n = other.n;
+      other.mmap_base = nullptr; other.mmap_coords = nullptr;
+      other.mmap_u8   = nullptr; other.mmap_size   = 0;
+    }
+    return *this;
+  }
+
+  // Copying an mmap-backed PointSet would double-free the mapping.
+  // Heap-backed PointSets can be copied safely; mmap-backed ones must be moved.
+  PointSet(const PointSet&) = default;
+  PointSet& operator=(const PointSet&) = default;
+
+  float* GetPoint(size_t i) {
+    if (mmap_coords) return mmap_coords + i * d;
+    if (mmap_u8) {
+      // Convert uint8 → float on the fly into a per-thread scratch buffer.
+      // Safe for parallel access: each thread has its own buffer.
+      thread_local std::vector<float> buf;
+      if (buf.size() < d) buf.resize(d);
+      const uint8_t* src = mmap_u8 + i * d;
+      for (size_t j = 0; j < d; ++j) buf[j] = static_cast<float>(src[j]);
+      return buf.data();
+    }
+    return &coordinates[i * d];
+  }
+
+  void Drop() {
+    coordinates.clear(); coordinates.shrink_to_fit();
+    if (mmap_base) {
+      munmap(mmap_base, mmap_size);
+      mmap_base   = nullptr;
+      mmap_coords = nullptr;
+      mmap_u8     = nullptr;
+      mmap_size   = 0;
+    }
+  }
+
   void Alloc() { coordinates.resize(n*d, 0.f); }
   void Resize(size_t _n) {
       n = _n;
       coordinates.resize(_n * d);
   }
   bool empty() const { return n == 0; }
+
+  ~PointSet() { Drop(); }
 };
 
 PointSet ExtractPointsInBucket(const std::vector<uint32_t>& bucket, PointSet& points);

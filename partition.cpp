@@ -78,7 +78,16 @@ int main(int argc, const char* argv[]) {
         return 0;
     }
 
-    PointSet points = ReadPoints(input_file);
+    // Use memory-mapped I/O so the OS pages data in on demand.
+    // This avoids a single huge malloc that fails when n*d*sizeof(elem) doesn't fit.
+    PointSet points;
+    if (input_file.ends_with(".fbin")) {
+        points = ReadPointsMmap(input_file);
+    } else if (input_file.ends_with(".u8bin")) {
+        points = ReadU8BinMmap(input_file);
+    } else {
+        points = ReadPoints(input_file);
+    }
     std::cout << "Finished reading points" << std::endl;
 
     if (part_method == "GP" && overlap != 0.0) {

@@ -1,0 +1,195 @@
+GP-ANN Streaming Insert/Delete/Search Benchmark — Workflow Guide
+================================================================
+
+OVERVIEW
+--------
+This benchmark evaluates a graph-partitioned ANN index under a streaming
+workload defined by a runbook (YAML). The runbook specifies a sequence of
+insert, delete, and search operations. The index is built once on the first
+insert batch, then subsequent inserts are routed naively to the nearest shard.
+
+Two benchmark binaries are available:
+  NaiveInsertBench       — single-node, multi-threaded
+  DistributedInsertBench — multi-node MPI, one rank per shard
+
+
+PREREQUISITES
+-------------
+  - Base vectors file: <dataset>.fbin
+  - Query vectors file: <queries>.fbin
+  - Runbook YAML: <runbook>.yaml  (NeurIPS 2023 streaming competition format)
+  - Ground-truth files: one per search step, named step<N>.gt100
+    where N is the YAML key of the search operation (e.g. step2.gt100,
+    step4.gt100, ...). These must reflect the live index state at each
+    search, accounting for all preceding inserts and deletes.
+  - Built binaries (see BUILD section below)
+
+
+BUILD
+-----
+From the repo root:
+
+    mkdir -p release_l2 && cd release_l2
+    cmake -DCMAKE_BUILD_TYPE=Release ..
+    make -j$(nproc) NaiveInsertBench DistributedInsertBench Partition
+
+To rebuild after code changes:
+
+    cd release_l2 && make -j$(nproc) NaiveInsertBench DistributedInsertBench
+
+MPI is auto-detected by CMake. DistributedInsertBench is only built if MPI
+is available. To check: look for "MPI found" in cmake output.
+
+
+STEP 1 — EXTRACT THE FIRST BATCH
+---------------------------------
+The Partition binary needs only the vectors from the first insert operation.
+Use the provided script to extract them into a standalone .fbin file:
+
+    python3 extract_first_batch.py <runbook.yaml> <base.fbin> first_batch.fbin
+
+This reads the start/end indices of the first insert from the runbook and
+seeks directly into the base file, so the full dataset does not need to fit
+in memory.
+
+
+STEP 2 — PARTITION THE FIRST BATCH
+------------------------------------
+Run the Partition binary on the extracted first batch:
+
+    ./release_l2/Partition <first_batch.fbin> <output-path> <num-shards> <method> <config> [overlap]
+
+Arguments:
+  first_batch.fbin   output of Step 1
+  output-path        base path for the output file (no extension)
+  num-shards         number of partitions (= MPI ranks for DistributedInsertBench)
+  method             partitioning method: GP | KMeans | BalancedKMeans | Pyramid | RKM
+  config             GP tuning: default | strong  (ignored for non-GP methods)
+  overlap            optional overlap fraction (e.g. 0.1); activates overlapping variants
+
+The output file is written to: <output-path>.k=<num-shards>.<method>
+
+Example:
+
+    ./release_l2/Partition first_batch.fbin msturing_partition 8 GP default
+
+Produces: msturing_partition.k=8.GP
+
+This file has 0-based IDs (0 to batch_size-1), which must be offset in Step 3.
+The number of shards should equal the number of MPI ranks you plan to use
+for DistributedInsertBench (or any value for NaiveInsertBench).
+
+
+STEP 3 — OFFSET PARTITION IDs TO GLOBAL IDs
+--------------------------------------------
+The bench binaries use global base-file indices as vector labels. The
+partition file from Step 2 uses 0-based IDs and must be remapped:
+
+    python3 offset_partition.py <runbook.yaml> <partition_in> <partition_out>
+
+Example (using the file produced in Step 2):
+
+    python3 offset_partition.py runbook.yaml msturing_partition.k=8.GP msturing_partition_global.k=8.GP
+
+This adds the first insert's start index to every ID in the partition file,
+making them consistent with the global labels used during search and recall.
+
+
+STEP 4a — RUN SINGLE-NODE BENCHMARK
+--------------------------------------
+    ./release_l2/NaiveInsertBench \
+        <base.fbin> \
+        <queries.fbin> \
+        <partition_out>       \  (from Step 3)
+        <gt_dir>              \  (directory containing step<N>.gt100 files)
+        <runbook.yaml>        \
+        <num_neighbors>       \
+        [num_probes_per_query]
+
+Example:
+
+    ./release_l2/NaiveInsertBench \
+        /data/msturing-100M-shift/base1b.fbin \
+        /data/msturing-100M-shift/queries.fbin \
+        first_batch_global.partition \
+        /data/msturing-100M-shift/gt \
+        msturing-100M-shift_runbookfinal.yaml \
+        10 1
+
+
+STEP 4b — RUN DISTRIBUTED BENCHMARK
+--------------------------------------
+The number of MPI ranks must equal the number of shards in the partition file.
+All nodes must have access to the same files (via NFS or equivalent).
+
+    mpirun -np <num_shards> \
+        --hostfile <hostfile> \
+        --mca btl_tcp_if_include <subnet>  \  (e.g. 192.168.0.0/24)
+        ./release_l2/DistributedInsertBench \
+        <base.fbin> \
+        <queries.fbin> \
+        <partition_out>       \  (from Step 3)
+        <gt_dir>              \
+        <runbook.yaml>        \
+        <num_neighbors>       \
+        [num_probes_per_query]
+
+Example:
+
+    mpirun -np 8 \
+        --hostfile hosts.txt \
+        --mca btl_tcp_if_include 192.168.0.0/24 \
+        ./release_l2/DistributedInsertBench \
+        /data/msturing-100M-shift/base1b.fbin \
+        /data/msturing-100M-shift/queries.fbin \
+        first_batch_global.partition \
+        /data/msturing-100M-shift/gt \
+        msturing-100M-shift_runbookfinal.yaml \
+        10 1
+
+Hostfile format (one rank per line):
+
+    node01 slots=1
+    node02 slots=1
+    ...
+
+
+OUTPUT
+------
+Each operation prints a line with timing and (for search steps) recall:
+
+  [op 1] BUILD   base[71524872,71556555)
+    build_time=42.3 s
+  [op 2] SEARCH  step=2  gt=gt/step2.gt100
+    query_time=1.84 s  QPS=5434  recall@10=0.921
+  [op 3] INSERT  base[71556555,71600000)  (43445 vectors)
+    insert_time=2.1 s  throughput=20688 vec/s
+
+If a GT file is missing for a search step, that step's recall is skipped
+but timing is still reported.
+
+
+SHARED FILESYSTEM SETUP (for distributed runs)
+-----------------------------------------------
+All ranks must be able to read the same paths. A simple NFS setup:
+
+On the head node (server):
+    sudo mkdir -p /data
+    echo "/data  192.168.0.0/24(ro,sync,no_subtree_check)" | sudo tee -a /etc/exports
+    sudo exportfs -ra
+
+On each worker node:
+    sudo mount <head-node-ip>:/data /data
+
+Verify with:
+    sudo exportfs -v        # on head node
+    ls /data                # on worker nodes
+
+
+DISTANCE METRIC
+---------------
+The default metric is L2. To use MIPS (inner product) instead, add
+-DMIPS_DISTANCE=ON to the cmake command:
+
+    cmake -DCMAKE_BUILD_TYPE=Release -DMIPS_DISTANCE=ON ..
+    make -j$(nproc) NaiveInsertBench DistributedInsertBench

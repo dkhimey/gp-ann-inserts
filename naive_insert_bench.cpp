@@ -70,9 +70,10 @@
 
 struct Operation {
     enum class Type { INSERT, DELETE, SEARCH };
-    Type     type   = Type::SEARCH;
-    uint32_t start  = 0;
-    uint32_t end    = 0;  // exclusive
+    Type     type     = Type::SEARCH;
+    uint32_t start    = 0;
+    uint32_t end      = 0;  // exclusive
+    uint32_t step_num = 0;  // the numeric YAML key for this op (used in GT filenames)
 };
 
 struct Runbook {
@@ -126,8 +127,9 @@ static Runbook ParseRunbook(const std::string& path) {
 
             // Numeric key → new operation; commit the previous one
             if (in_op) rb.ops.push_back(cur);
-            cur   = Operation{};
-            in_op = true;
+            cur          = Operation{};
+            cur.step_num = static_cast<uint32_t>(std::stoul(key));
+            in_op        = true;
             continue;
         }
 
@@ -254,7 +256,6 @@ int main(int argc, const char* argv[]) {
     std::vector<int> routing_partition;
 
     bool index_built = false;
-    int  search_step = 0;   // 0-based GT file counter
     Timer timer;
 
     // -----------------------------------------------------------------------
@@ -298,6 +299,16 @@ int main(int argc, const char* argv[]) {
                     }
                 }
 
+                // The cluster file uses global base-file IDs.  The router
+                // training uses init_points which is a local 0-based slice, so
+                // remap cluster IDs to local indices for the KMeansTreeRouter.
+                Clusters local_clusters(clusters.size());
+                for (size_t b = 0; b < clusters.size(); ++b) {
+                    local_clusters[b].resize(clusters[b].size());
+                    for (size_t i = 0; i < clusters[b].size(); ++i)
+                        local_clusters[b][i] = clusters[b][i] - init_start;
+                }
+
                 // Train router on the initial vectors.
                 KMeansTreeRouterOptions opts{
                     .num_centroids    = 32,
@@ -307,7 +318,7 @@ int main(int argc, const char* argv[]) {
                 };
                 kmtr = std::make_unique<KMeansTreeRouter>();
                 timer.Start();
-                kmtr->Train(init_points, clusters, opts);
+                kmtr->Train(init_points, local_clusters, opts);
                 std::cout << "  KMeans-tree router : " << timer.Stop() << " s\n";
 
                 {
@@ -325,12 +336,14 @@ int main(int argc, const char* argv[]) {
 
                 // Build per-shard HNSW.  Pre-reserve capacity proportionally to
                 // max_pts so future inserts don't need to resize.
+                // Pass init_start as id_offset so GetPoint uses local indices
+                // while hnswlib labels remain global.
                 ivf = std::make_unique<InvertedIndexHNSW>(init_points, rb.max_pts);
                 ivf->hnsw_parameters = HNSWParameters{
                     .M = 16, .ef_construction = 200, .ef_search = 120 };
 
                 timer.Start();
-                ivf->Build(init_points, clusters, rb.max_pts);
+                ivf->Build(init_points, clusters, rb.max_pts, init_start);
                 std::cout << "  IVF-HNSW build     : " << timer.Stop() << " s"
                           << "  (capacity=" << rb.max_pts << ")\n";
 
@@ -392,15 +405,14 @@ int main(int argc, const char* argv[]) {
             }
 
             const std::string gt_file =
-                gt_prefix + "/step" + std::to_string(search_step) + ".gt100";
+                gt_prefix + "/step" + std::to_string(op.step_num) + ".gt100";
 
             std::cout << "[op " << op_idx + 1 << "] SEARCH"
-                      << "  step=" << search_step
+                      << "  step=" << op.step_num
                       << "  gt=" << gt_file << "\n";
 
             if (!std::filesystem::exists(gt_file)) {
                 std::cout << "  GT file not found — skipping recall.\n";
-                ++search_step;
                 continue;
             }
 
@@ -422,11 +434,9 @@ int main(int argc, const char* argv[]) {
                       << "  query_time=" << qtime << " s"
                       << "  QPS=" << queries.n / qtime
                       << "  num_probes=" << num_probes_q << "\n";
-
-            ++search_step;
         }
     }
 
-    std::cout << "\nDone. " << search_step << " search step(s) evaluated.\n";
+    std::cout << "\nDone.\n";
     return 0;
 }
