@@ -57,9 +57,25 @@ STEP 2 — PARTITION THE FIRST BATCH
 ------------------------------------
 Run the Partition binary on the extracted first batch:
 
-    ./release_l2/Partition first_batch.fbin <num_shards> <output_prefix>
+    ./release_l2/Partition <first_batch.fbin> <output-path> <num-shards> <method> <config> [overlap]
 
-This produces a partition file with 0-based IDs (0 to batch_size-1).
+Arguments:
+  first_batch.fbin   output of Step 1
+  output-path        base path for the output file (no extension)
+  num-shards         number of partitions (= MPI ranks for DistributedInsertBench)
+  method             partitioning method: GP | KMeans | BalancedKMeans | Pyramid | RKM
+  config             GP tuning: default | strong  (ignored for non-GP methods)
+  overlap            optional overlap fraction (e.g. 0.1); activates overlapping variants
+
+The output file is written to: <output-path>.k=<num-shards>.<method>
+
+Example:
+
+    ./release_l2/Partition first_batch.fbin msturing_partition 8 GP default
+
+Produces: msturing_partition.k=8.GP
+
+This file has 0-based IDs (0 to batch_size-1), which must be offset in Step 3.
 The number of shards should equal the number of MPI ranks you plan to use
 for DistributedInsertBench (or any value for NaiveInsertBench).
 
@@ -71,9 +87,9 @@ partition file from Step 2 uses 0-based IDs and must be remapped:
 
     python3 offset_partition.py <runbook.yaml> <partition_in> <partition_out>
 
-Example:
+Example (using the file produced in Step 2):
 
-    python3 offset_partition.py runbook.yaml first_batch.partition first_batch_global.partition
+    python3 offset_partition.py runbook.yaml msturing_partition.k=8.GP msturing_partition_global.k=8.GP
 
 This adds the first insert's start index to every ID in the partition file,
 making them consistent with the global labels used during search and recall.
