@@ -261,20 +261,11 @@ public:
         PointSet init = ReadPointsRange(point_file, batch_start, batch_end);
         dim = (int)init.d;
 
-        // The cluster file uses global base-file IDs; init is a local 0-based
-        // slice.  Remap cluster IDs to local indices for router training only.
-        Clusters local_clusters(clusters.size());
-        for (size_t b = 0; b < clusters.size(); ++b) {
-            local_clusters[b].resize(clusters[b].size());
-            for (size_t i = 0; i < clusters[b].size(); ++i)
-                local_clusters[b][i] = clusters[b][i] - batch_start;
-        }
-
         KMeansTreeRouterOptions opts{
             .num_centroids=32, .min_cluster_size=200,
             .budget=50000, .search_budget=5000 };
         kmtr = std::make_unique<KMeansTreeRouter>();
-        kmtr->Train(init, local_clusters, opts);
+        kmtr->Train(init, clusters, opts);
         { auto [rp, rpart] = kmtr->ExtractPoints();
           routing_points = std::move(rp); routing_partition = std::move(rpart); }
         router = std::make_unique<HNSWRouter>(

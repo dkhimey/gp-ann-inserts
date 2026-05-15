@@ -42,13 +42,7 @@ struct InvertedIndexHNSW {
     // all shards (initial + all future inserts).  Each shard gets a proportional
     // reservation so that naive inserts rarely trigger an expensive resize.
     // Pass 0 (or use the single-arg overload) for a tight initial allocation.
-    //
-    // id_offset: subtract from each cluster ID to get the local index into
-    // `points`.  Use when the cluster file contains global base-file IDs but
-    // `points` is a locally-indexed slice starting at 0.  The global ID is
-    // still used as the hnswlib label and stored in label_to_shard.
-    void Build(PointSet& points, const Clusters& clusters, size_t total_capacity,
-               uint32_t id_offset = 0) {
+    void Build(PointSet& points, const Clusters& clusters, size_t total_capacity) {
         size_t num_shards = clusters.size();
         bucket_hnsws.resize(num_shards);
 
@@ -86,8 +80,8 @@ struct InvertedIndexHNSW {
         parlay::parallel_for(0, clusters.size(), [&](size_t b) {
             parlay::parallel_for(0, clusters[b].size(), [&](size_t i_local) {
                 uint32_t id = clusters[b][i_local];
-                float* p = points.GetPoint(id - id_offset);  // local index
-                bucket_hnsws[b]->addPoint(p, id);            // global label
+                float* p = points.GetPoint(id);
+                bucket_hnsws[b]->addPoint(p, id);
                 label_to_shard[id] = static_cast<int>(b);
             });
         });
