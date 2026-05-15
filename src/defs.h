@@ -19,6 +19,38 @@ struct PointSet {
 
   size_t d = 0, n = 0;
 
+  // Default and heap-backed construction is fine.
+  PointSet() = default;
+
+  // Move constructor: transfer mmap ownership, zero out the source.
+  PointSet(PointSet&& other) noexcept
+      : coordinates(std::move(other.coordinates)),
+        mmap_base(other.mmap_base), mmap_size(other.mmap_size),
+        mmap_coords(other.mmap_coords), mmap_u8(other.mmap_u8),
+        d(other.d), n(other.n) {
+    other.mmap_base = nullptr; other.mmap_coords = nullptr;
+    other.mmap_u8   = nullptr; other.mmap_size   = 0;
+  }
+
+  // Move assignment: release own resources, then steal from other.
+  PointSet& operator=(PointSet&& other) noexcept {
+    if (this != &other) {
+      Drop();
+      coordinates  = std::move(other.coordinates);
+      mmap_base    = other.mmap_base;   mmap_size   = other.mmap_size;
+      mmap_coords  = other.mmap_coords; mmap_u8     = other.mmap_u8;
+      d = other.d; n = other.n;
+      other.mmap_base = nullptr; other.mmap_coords = nullptr;
+      other.mmap_u8   = nullptr; other.mmap_size   = 0;
+    }
+    return *this;
+  }
+
+  // Copying an mmap-backed PointSet would double-free the mapping.
+  // Heap-backed PointSets can be copied safely; mmap-backed ones must be moved.
+  PointSet(const PointSet&) = default;
+  PointSet& operator=(const PointSet&) = default;
+
   float* GetPoint(size_t i) {
     if (mmap_coords) return mmap_coords + i * d;
     if (mmap_u8) {
