@@ -317,12 +317,11 @@ public:
         for (uint32_t i = 0; i < batch.n; ++i) {
             const uint32_t gid = start + i;
             float* p = batch.GetPoint(i);
-            const int t = router->NaiveRoute(p);
-            label_to_shard[gid] = t;
-            // All ranks read every vector so label_to_shard stays consistent,
-            // but only one rank sends each vector to avoid comm_size-fold
-            // duplication on the target shard.
+            // Each rank is responsible for routing a disjoint subset of vectors.
+            // label_to_shard is updated after the AlltoAllv via MPI_Allgatherv
+            // (see below), which records the actual shard each vector landed on.
             if ((int)(i % comm_size) == rank) {
+                const int t = router->NaiveRoute(p);
                 send_ids[t].push_back(gid);
                 send_vecs[t].insert(send_vecs[t].end(), p, p + dim);
             }
@@ -360,47 +359,52 @@ public:
         const double elapsed = MPI_Wtime() - t0;
         double max_t = 0.0;
         MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+        // Share the actual label->shard mapping with every rank.
+        // The routing HNSW is built with non-deterministic parallel insertion,
+        // so NaiveRoute can return different shards on different ranks for the
+        // same vector.  The only authoritative record of which shard owns a
+        // label is on the rank that actually received it via AlltoAllv.
+        // MPI_Allgatherv broadcasts each rank's received-label list so all
+        // ranks can update label_to_shard consistently.
+        {
+            int local_n = (int)ins_ids.size();
+            std::vector<int> all_ns(comm_size);
+            MPI_Allgather(&local_n, 1, MPI_INT,
+                          all_ns.data(), 1, MPI_INT, MPI_COMM_WORLD);
+            std::vector<int> disps(comm_size, 0);
+            for (int r = 1; r < comm_size; ++r) disps[r] = disps[r-1] + all_ns[r-1];
+            const int total = disps[comm_size-1] + all_ns[comm_size-1];
+            std::vector<uint32_t> all_labels(total);
+            MPI_Allgatherv(ins_ids.data(), local_n, MPI_UINT32_T,
+                           all_labels.data(), all_ns.data(), disps.data(),
+                           MPI_UINT32_T, MPI_COMM_WORLD);
+            for (int r = 0; r < comm_size; ++r)
+                for (int j = disps[r]; j < disps[r] + all_ns[r]; ++j)
+                    label_to_shard[all_labels[j]] = r;
+        }
+
         return max_t;
     }
 
     // -----------------------------------------------------------------------
-    // Returns max elapsed time across ranks (timed section: Alltoallv + markDelete).
+    // Returns max elapsed time across ranks (local markDelete, no AlltoAllv).
     double ProcessDeletes(uint32_t start, uint32_t end) {
-        // Collect all IDs in the range that are currently live.  We need this
-        // full list on every rank so that ALL ranks can erase those IDs from
-        // label_to_shard after the operation, keeping the map consistent.
-        // (label_to_shard is identical on every rank; a delete must be reflected
-        //  everywhere, not just on the owning shard.)
-        std::vector<uint32_t> all_delete_ids;
-        std::vector<std::vector<uint32_t>> send_labels(comm_size);
-        for (uint32_t id = start; id < end; ++id) {
-            auto it = label_to_shard.find(id);
-            if (it == label_to_shard.end()) continue;
-            all_delete_ids.push_back(id);
-            // Mirror the ProcessInserts deduplication: only one rank sends each
-            // label so the owning shard receives exactly one markDelete per ID.
-            // Without this guard every rank sends every label and the shard gets
-            // comm_size copies, causing markDelete to throw on the second call.
-            if ((int)(id % (uint32_t)comm_size) == rank)
-                send_labels[it->second].push_back(id);
-        }
-
+        // label_to_shard is kept consistent across all ranks by ProcessInserts
+        // (via MPI_Allgatherv).  Each rank therefore knows exactly which labels
+        // it owns, so deletes require no inter-rank communication: each rank
+        // directly calls markDelete for the labels it owns, and every rank
+        // removes the deleted IDs from its label_to_shard map.
         MPI_Barrier(MPI_COMM_WORLD);
         const double t0 = MPI_Wtime();
 
-        std::vector<std::vector<uint32_t>> recv_labels;
-        AllToAllV(send_labels, recv_labels, MPI_UINT32_T, comm_size, MPI_COMM_WORLD);
-
-        for (int src = 0; src < comm_size; ++src)
-            for (uint32_t id : recv_labels[src])
+        for (uint32_t id = start; id < end; ++id) {
+            auto it = label_to_shard.find(id);
+            if (it == label_to_shard.end()) continue;
+            if (it->second == rank)
                 local_hnsw->markDelete(id);
-
-        // All ranks must erase every deleted ID from label_to_shard so the map
-        // stays consistent.  Previously only the owning rank erased its received
-        // labels, leaving stale entries on every other rank and causing crashes
-        // if those IDs appeared in any future delete range.
-        for (uint32_t id : all_delete_ids)
-            label_to_shard.erase(id);
+            label_to_shard.erase(it);
+        }
 
         const double elapsed = MPI_Wtime() - t0;
         double max_t = 0.0;
