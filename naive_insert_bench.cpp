@@ -299,6 +299,16 @@ int main(int argc, const char* argv[]) {
                     }
                 }
 
+                // The cluster file uses global base-file IDs.  The router
+                // training uses init_points which is a local 0-based slice, so
+                // remap cluster IDs to local indices for the KMeansTreeRouter.
+                Clusters local_clusters(clusters.size());
+                for (size_t b = 0; b < clusters.size(); ++b) {
+                    local_clusters[b].resize(clusters[b].size());
+                    for (size_t i = 0; i < clusters[b].size(); ++i)
+                        local_clusters[b][i] = clusters[b][i] - init_start;
+                }
+
                 // Train router on the initial vectors.
                 KMeansTreeRouterOptions opts{
                     .num_centroids    = 32,
@@ -308,7 +318,7 @@ int main(int argc, const char* argv[]) {
                 };
                 kmtr = std::make_unique<KMeansTreeRouter>();
                 timer.Start();
-                kmtr->Train(init_points, clusters, opts);
+                kmtr->Train(init_points, local_clusters, opts);
                 std::cout << "  KMeans-tree router : " << timer.Stop() << " s\n";
 
                 {
@@ -326,12 +336,14 @@ int main(int argc, const char* argv[]) {
 
                 // Build per-shard HNSW.  Pre-reserve capacity proportionally to
                 // max_pts so future inserts don't need to resize.
+                // Pass init_start as id_offset so GetPoint uses local indices
+                // while hnswlib labels remain global.
                 ivf = std::make_unique<InvertedIndexHNSW>(init_points, rb.max_pts);
                 ivf->hnsw_parameters = HNSWParameters{
                     .M = 16, .ef_construction = 200, .ef_search = 120 };
 
                 timer.Start();
-                ivf->Build(init_points, clusters, rb.max_pts);
+                ivf->Build(init_points, clusters, rb.max_pts, init_start);
                 std::cout << "  IVF-HNSW build     : " << timer.Stop() << " s"
                           << "  (capacity=" << rb.max_pts << ")\n";
 
