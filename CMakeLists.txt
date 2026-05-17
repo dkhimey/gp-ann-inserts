@@ -83,7 +83,16 @@ if(MPI_CXX_FOUND)
                                                    src/defs.cpp src/dist.cpp
                                                    src/kmeans.cpp src/points_io.cpp
                                                    src/metis_io.cpp)
-    message(STATUS "MPI found — DistributedInsertBench will be built")
+    add_executable(DistributedInsertBenchSweep distributed_insert_bench_sweep.cpp)
+    target_link_libraries(DistributedInsertBenchSweep PUBLIC parlay MPI::MPI_CXX)
+    if(MIPS_DISTANCE)
+        target_compile_definitions(DistributedInsertBenchSweep PUBLIC MIPS_DISTANCE)
+    endif()
+    target_sources(DistributedInsertBenchSweep PRIVATE src/kmeans_tree_router.cpp
+                                                        src/defs.cpp src/dist.cpp
+                                                        src/kmeans.cpp src/points_io.cpp
+                                                        src/metis_io.cpp)
+    message(STATUS "MPI found — DistributedInsertBench + DistributedInsertBenchSweep will be built")
 else()
     message(STATUS "MPI not found — DistributedInsertBench will NOT be built")
 endif()
