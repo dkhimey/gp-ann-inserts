@@ -300,13 +300,16 @@ public:
                           uint32_t start, uint32_t end) {
         PointSet batch = ReadPointsRange(point_file, start, end);
 
+        // Each rank routes only its disjoint slice (i % comm_size == rank).
+        // label_to_shard is then synced via MPI_Allgatherv so every rank has
+        // a consistent map — required for correct no-communication deletes.
         std::vector<std::vector<uint32_t>> send_ids(comm_size);
         std::vector<std::vector<float>>    send_vecs(comm_size);
         for (uint32_t i = 0; i < batch.n; ++i) {
+            if ((int)(i % comm_size) != rank) continue;
             const uint32_t gid = start + i;
             float* p = batch.GetPoint(i);
             const int t = router->NaiveRoute(p);
-            label_to_shard[gid] = t;
             send_ids[t].push_back(gid);
             send_vecs[t].insert(send_vecs[t].end(), p, p + dim);
         }
@@ -342,29 +345,45 @@ public:
         const double elapsed = MPI_Wtime() - t0;
         double max_t = 0.0;
         MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+        // Broadcast the actual label→shard assignments to all ranks.
+        // NaiveRoute is non-deterministic (parallel HNSW), so each rank must
+        // learn the true destinations decided by other ranks.
+        {
+            int local_n = (int)ins_ids.size();
+            std::vector<int> all_ns(comm_size);
+            MPI_Allgather(&local_n, 1, MPI_INT,
+                          all_ns.data(), 1, MPI_INT, MPI_COMM_WORLD);
+            std::vector<int> disps(comm_size, 0);
+            for (int r = 1; r < comm_size; ++r) disps[r] = disps[r-1] + all_ns[r-1];
+            const int total = disps[comm_size-1] + all_ns[comm_size-1];
+            std::vector<uint32_t> all_labels(total);
+            MPI_Allgatherv(ins_ids.data(), local_n, MPI_UINT32_T,
+                           all_labels.data(), all_ns.data(), disps.data(),
+                           MPI_UINT32_T, MPI_COMM_WORLD);
+            for (int r = 0; r < comm_size; ++r)
+                for (int j = disps[r]; j < disps[r] + all_ns[r]; ++j)
+                    label_to_shard[all_labels[j]] = r;
+        }
+
         return max_t;
     }
 
     // -----------------------------------------------------------------------
     double ProcessDeletes(uint32_t start, uint32_t end) {
-        std::vector<std::vector<uint32_t>> send_labels(comm_size);
-        for (uint32_t id = start; id < end; ++id) {
-            const auto it = label_to_shard.find(id);
-            const int32_t t = (it != label_to_shard.end()) ? it->second : -1;
-            if (t >= 0) send_labels[t].push_back(id);
-        }
-
+        // label_to_shard is consistent on all ranks (kept in sync by
+        // MPI_Allgatherv in ProcessInserts).  Each rank directly marks only
+        // the labels it owns — no AlltoAllv needed.
         MPI_Barrier(MPI_COMM_WORLD);
         const double t0 = MPI_Wtime();
 
-        std::vector<std::vector<uint32_t>> recv_labels;
-        AllToAllV(send_labels, recv_labels, MPI_UINT32_T, comm_size, MPI_COMM_WORLD);
-
-        for (int src = 0; src < comm_size; ++src)
-            for (uint32_t id : recv_labels[src]) {
+        for (uint32_t id = start; id < end; ++id) {
+            auto it = label_to_shard.find(id);
+            if (it == label_to_shard.end()) continue;
+            if (it->second == rank)
                 local_hnsw->markDelete(id);
-                label_to_shard.erase(id);
-            }
+            label_to_shard.erase(it);
+        }
 
         const double elapsed = MPI_Wtime() - t0;
         double max_t = 0.0;
