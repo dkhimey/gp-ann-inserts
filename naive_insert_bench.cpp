@@ -206,7 +206,6 @@ int main(int argc, const char* argv[]) {
     const int         num_probes_q   = (argc == 8) ? std::stoi(argv[7]) : 1;
 
     // Number of nearest routing points to vote over during query time.
-    const int num_voting_neighbors = 10;
 
     // -----------------------------------------------------------------------
     // Parse runbook
@@ -256,6 +255,7 @@ int main(int argc, const char* argv[]) {
     std::vector<int> routing_partition;
 
     bool index_built = false;
+    int  num_voting_neighbors = 0;  // set on first insert to 3 * num_probes_q
     Timer timer;
 
     // -----------------------------------------------------------------------
@@ -288,6 +288,7 @@ int main(int argc, const char* argv[]) {
                 // Load and validate partition.
                 Clusters clusters  = ReadClusters(partition_file);
                 const int num_shards = static_cast<int>(clusters.size());
+                num_voting_neighbors = 3 * num_probes_q;
                 {
                     size_t covered = 0;
                     for (const auto& c : clusters) covered += c.size();
