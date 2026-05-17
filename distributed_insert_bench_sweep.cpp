@@ -188,7 +188,7 @@ class DistributedInsertBenchmark {
 public:
     int rank = 0, comm_size = 1, num_shards = 1, dim = 0;
     int num_neighbors        = 10;
-    int num_voting_neighbors = 10;
+    int num_voting_neighbors = 100;
 
     std::vector<size_t> GatherShardSizes() const {
         const size_t local_count = local_hnsw ? local_hnsw->cur_element_count.load() : 0;
@@ -595,7 +595,7 @@ int main(int argc, const char* argv[]) {
     bench.num_neighbors       = num_neighbors;
     // num_voting_neighbors = 3*num_shards so every shard gets a real distance
     // estimate regardless of which nprobe value we're sweeping.
-    bench.num_voting_neighbors = 3*comm_size;
+    bench.num_voting_neighbors = 10*comm_size;
 
     bool index_built = false;
 
