@@ -101,6 +101,23 @@ std::vector<float> ConvertGroundTruthToDistanceToKthNeighbor(std::vector<NNVec>&
         for (int j = 0; j < k; ++j) {
             uint32_t point_id = neighs[j].second;
             float dist = neighs[j].first;
+
+            // Bounds check: diagnose out-of-range point IDs before they segfault.
+            // Likely causes: (1) int32_t -1 sentinels read as uint32_t (~4.3B),
+            //                (2) ground truth computed on full 1B dataset but only 100M loaded.
+            if (point_id >= static_cast<uint32_t>(points.n)) {
+                // Cast to int32_t to detect -1 sentinels vs. genuinely large IDs.
+                int32_t signed_id = static_cast<int32_t>(point_id);
+                if (q == 0) {  // only print once per run to avoid log spam
+                    std::cerr << "[OOB] query=" << q << " neighbor=" << j
+                              << " point_id(uint32)=" << point_id
+                              << " point_id(int32)=" << signed_id
+                              << " points.n=" << points.n << std::endl;
+                }
+                __atomic_fetch_add(&distance_mismatches, 1, __ATOMIC_RELAXED);
+                continue;
+            }
+
             float true_dist = distance(points.GetPoint(point_id), Q, points.d);
             if (std::abs(dist - true_dist) > 1e-8) {
                 local_distance_mismatches++;
