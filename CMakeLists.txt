@@ -74,6 +74,16 @@ add_subdirectory(src)
 
 find_package(MPI)
 if(MPI_CXX_FOUND)
+    add_executable(DistributedBench distributed_bench.cpp)
+    target_link_libraries(DistributedBench PUBLIC parlay MPI::MPI_CXX)
+    if(MIPS_DISTANCE)
+        target_compile_definitions(DistributedBench PUBLIC MIPS_DISTANCE)
+    endif()
+    target_sources(DistributedBench PRIVATE src/kmeans_tree_router.cpp
+                                            src/defs.cpp src/dist.cpp
+                                            src/kmeans.cpp src/points_io.cpp
+                                            src/metis_io.cpp)
+
     add_executable(DistributedInsertBench distributed_insert_bench.cpp)
     target_link_libraries(DistributedInsertBench PUBLIC parlay MPI::MPI_CXX)
     if(MIPS_DISTANCE)
@@ -92,7 +102,7 @@ if(MPI_CXX_FOUND)
                                                         src/defs.cpp src/dist.cpp
                                                         src/kmeans.cpp src/points_io.cpp
                                                         src/metis_io.cpp)
-    message(STATUS "MPI found — DistributedInsertBench + DistributedInsertBenchSweep will be built")
+    message(STATUS "MPI found — DistributedBench + DistributedInsertBench + DistributedInsertBenchSweep will be built")
 else()
-    message(STATUS "MPI not found — DistributedInsertBench will NOT be built")
+    message(STATUS "MPI not found — MPI targets will NOT be built")
 endif()
