@@ -39,14 +39,17 @@ int main(int argc, const char* argv[]) {
     MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
 
     // ── Build index once; reuse across all nprobe values ─────────────────────────
+    std::cout << "[DistributedBench] Building index on all ranks …\n";
     DistributedQueryBenchmark bench;
     bench.num_neighbors = std::stoi(k_string);
     bench.LoadPartitionFromClusters(clusters_file);
     bench.LoadShardPointSet(point_file);
     bench.BuildRouterFromSample(point_file);
     bench.BuildInShardIndex();
+    std::cout << "[DistributedBench] Index built.\n";
 
     // ── Load queries (all ranks) ──────────────────────────────────────────────────
+    std::cout << "[DistributedBench] Loading queries on all ranks …\n";
     PointSet queries = ReadPoints(query_file);
     std::vector<int> query_ids(queries.n);
     std::iota(query_ids.begin(), query_ids.end(), 0);
@@ -54,6 +57,7 @@ int main(int argc, const char* argv[]) {
     std::vector<int> my_query_ids(
         query_ids.begin() + rank * chunk_size,
         query_ids.begin() + std::min(query_ids.size(), (rank + 1) * chunk_size));
+    std::cout << "[DistributedBench] Rank " << rank << " has " << my_query_ids.size() << " queries.\n";
 
     // ── Ground truth (all ranks load for distributed recall computation) ─────────
     std::vector<NNVec> ground_truth;
