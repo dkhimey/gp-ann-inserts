@@ -66,7 +66,8 @@ public:
     int num_neighbors = 10;
 
     PointSet          shard_points;
-    std::vector<int>  partition;
+    std::vector<int>  partition;               // base-point → shard mapping
+    std::vector<int>  routing_index_partition; // centroid → shard mapping (owned, keeps HNSWRouter ref alive)
 
 #ifdef MIPS_DISTANCE
     using SpaceT = hnswlib::InnerProductSpace;
@@ -144,7 +145,12 @@ public:
     }
 
     void LoadRouter(const std::string& hnsw_router_file) {
-        router = std::make_unique<HNSWRouter>(hnsw_router_file, dim, partition);
+        // The HNSW router indexes centroids, not base points.  Its companion
+        // file (*.routing_index_partition) maps centroid IDs → shard IDs.
+        // We must pass that partition — NOT the base-point partition — so that
+        // router.Query() returns the correct shard for each near centroid.
+        routing_index_partition = ReadMetisPartition(hnsw_router_file + ".routing_index_partition");
+        router = std::make_unique<HNSWRouter>(hnsw_router_file, dim, routing_index_partition);
     }
 
     // -----------------------------------------------------------------------

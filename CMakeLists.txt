@@ -32,6 +32,7 @@ add_executable(OracleRecall oracle_recall.cpp)
 add_executable(GraphQualityBench graph_quality_benchmark.cpp)
 add_executable(AnalyzeApproximationLosses analyze_approximation_losses.cpp)
 add_executable(NaiveInsertBench naive_insert_bench.cpp)
+add_executable(BuildRouter build_router.cpp)
 
 set(TARGETS
 		SmallScaleQueries
@@ -43,6 +44,7 @@ set(TARGETS
 		GraphQualityBench
 		AnalyzeApproximationLosses
 		NaiveInsertBench
+		BuildRouter
 )
 
 foreach(target IN LISTS TARGETS)

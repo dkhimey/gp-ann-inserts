@@ -29,3 +29,5 @@ target_sources(OracleRecall PRIVATE routes.cpp kmeans_tree_router.cpp)
 target_sources(AnalyzeApproximationLosses PRIVATE routes.cpp kmeans_tree_router.cpp)
 
 target_sources(NaiveInsertBench PRIVATE kmeans_tree_router.cpp)
+
+target_sources(BuildRouter PRIVATE kmeans_tree_router.cpp)
