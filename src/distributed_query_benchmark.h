@@ -74,16 +74,19 @@ public:
                                size_t sample_size = 100000) {
         PointSet sample = ReadPoints(point_file, static_cast<int64_t>(sample_size));
 
-        // Build a partition array aligned to the sample (indices 0..sample.n-1).
+        // Clamp to however many points the partition actually covers.
         const size_t n_sample = std::min(static_cast<size_t>(sample.n),
                                          partition.size());
-        std::vector<int> sample_partition(partition.begin(),
-                                          partition.begin() + n_sample);
         sample.n = static_cast<uint32_t>(n_sample);
 
+        // Pass this->partition (the class member) — NOT a local copy.
+        // HNSWRouter stores a const reference, so the referent must outlive
+        // the router. A local sample_partition vector would be destroyed on
+        // return, leaving router->partition as a dangling reference and
+        // causing a segfault on the first Route() call.
         HNSWParameters router_params;   // M=32, ef_construction=200, ef_search=250
         router = std::make_unique<HNSWRouter>(
-            sample, num_shards, sample_partition, router_params);
+            sample, num_shards, partition, router_params);
         router->Train(sample);
     }
 
