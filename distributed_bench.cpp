@@ -43,8 +43,11 @@ int main(int argc, const char* argv[]) {
     DistributedQueryBenchmark bench;
     bench.num_neighbors = std::stoi(k_string);
     bench.LoadPartitionFromClusters(clusters_file);
+    std::cout << "[DistributedBench] Rank " << rank << "] Partition loaded. Building local index …\n";
     bench.LoadShardPointSet(point_file);
+    std::cout << "[DistributedBench] Rank " << rank << "] Shard points loaded. Building router …\n";
     bench.BuildRouterFromSample(point_file);
+    std::cout << "[DistributedBench] Rank " << rank << "] Router built. Building local HNSW index …\n";
     bench.BuildInShardIndex();
     std::cout << "[DistributedBench] Rank " << rank << "] Index built.\n";
 
