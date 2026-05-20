@@ -28,6 +28,7 @@ add_executable(Convert convert.cpp)
 add_executable(Partition partition.cpp)
 add_executable(QueryAttribution run_query_attribution.cpp)
 add_executable(OracleRecall oracle_recall.cpp)
+# add_executable(DistributedBench distributed_bench.cpp)
 add_executable(GraphQualityBench graph_quality_benchmark.cpp)
 add_executable(AnalyzeApproximationLosses analyze_approximation_losses.cpp)
 add_executable(NaiveInsertBench naive_insert_bench.cpp)
@@ -38,6 +39,7 @@ set(TARGETS
 		Partition
 		QueryAttribution
 		OracleRecall
+		# DistributedBench
 		GraphQualityBench
 		AnalyzeApproximationLosses
 		NaiveInsertBench
@@ -49,6 +51,7 @@ endforeach()
 
 target_link_libraries(Partition PUBLIC kaminpar_shm)
 target_link_libraries(GraphQualityBench PUBLIC kaminpar_shm)
+# target_link_libraries(DistributedBench PUBLIC message-queue kassert::kassert)
 
 OPTION(MIPS_DISTANCE "Use MIPS distance instead of L2" OFF)
 if(MIPS_DISTANCE)
@@ -71,14 +74,6 @@ add_subdirectory(src)
 
 find_package(MPI)
 if(MPI_CXX_FOUND)
-    add_executable(DistributedBench distributed_bench.cpp)
-    target_link_libraries(DistributedBench PUBLIC parlay MPI::MPI_CXX)
-    if(MIPS_DISTANCE)
-        target_compile_definitions(DistributedBench PUBLIC MIPS_DISTANCE)
-    endif()
-    target_sources(DistributedBench PRIVATE src/defs.cpp src/dist.cpp
-                                            src/points_io.cpp src/metis_io.cpp)
-
     add_executable(DistributedInsertBench distributed_insert_bench.cpp)
     target_link_libraries(DistributedInsertBench PUBLIC parlay MPI::MPI_CXX)
     if(MIPS_DISTANCE)
