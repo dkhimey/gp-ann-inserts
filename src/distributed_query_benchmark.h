@@ -173,7 +173,7 @@ public:
     //
     // Results are collected but not further processed here; the caller measures
     // wall-clock time end-to-end.
-    void ProcessQueries(const std::vector<int>& query_ids, PointSet& queries) {
+    std::tuple<std::vector<std::vector<uint32_t>>, std::vector<std::vector<uint32_t>>, std::vector<std::vector<float>>> ProcessQueries(const std::vector<int>& query_ids, PointSet& queries) {
         using namespace dqb_detail;
 
         // ------------------------------------------------------------------
@@ -239,6 +239,7 @@ public:
         AllToAllV(snd_rdists, rcv_rdists, MPI_FLOAT,    comm_size, MPI_COMM_WORLD);
 
         // Results available in rcv_r* — communication round-trip complete.
-        (void)rcv_rqids; (void)rcv_rids; (void)rcv_rdists;
+        // (void)rcv_rqids; (void)rcv_rids; (void)rcv_rdists;
+        return std::make_tuple(rcv_rqids, rcv_rids, rcv_rdists);
     }
 };
