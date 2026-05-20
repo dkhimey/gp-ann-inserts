@@ -2,58 +2,105 @@
 
 #include "points_io.h"
 #include "metis_io.h"
-
 #include "hnsw_router.h"
 #include "../external/hnswlib/hnswlib/hnswlib.h"
 
-#include "../external/message-queue/include/message-queue/buffered_queue.hpp"
-
+#include <mpi.h>
 #include <parlay/primitives.h>
+
+#include <limits>
+#include <memory>
+#include <numeric>
+#include <vector>
+
+// ---------------------------------------------------------------------------
+// Generic Alltoallv helper
+// ---------------------------------------------------------------------------
+
+namespace dqb_detail {
+
+template<typename T>
+inline void AllToAllV(const std::vector<std::vector<T>>& send_bufs,
+                      std::vector<std::vector<T>>&       recv_bufs,
+                      MPI_Datatype                       dtype,
+                      int                                comm_size,
+                      MPI_Comm                           comm)
+{
+    std::vector<int> sc(comm_size), sd(comm_size, 0);
+    for (int r = 0; r < comm_size; ++r) sc[r] = (int)send_bufs[r].size();
+    for (int r = 1; r < comm_size; ++r) sd[r] = sd[r-1] + sc[r-1];
+
+    std::vector<T> sf;
+    { size_t tot = 0; for (const auto& b : send_bufs) tot += b.size(); sf.reserve(tot); }
+    for (int r = 0; r < comm_size; ++r)
+        sf.insert(sf.end(), send_bufs[r].begin(), send_bufs[r].end());
+
+    std::vector<int> rc(comm_size, 0), rd(comm_size, 0);
+    MPI_Alltoall(sc.data(), 1, MPI_INT, rc.data(), 1, MPI_INT, comm);
+    for (int r = 1; r < comm_size; ++r) rd[r] = rd[r-1] + rc[r-1];
+
+    const size_t total_recv = (size_t)rd[comm_size-1] + rc[comm_size-1];
+    std::vector<T> rf(total_recv);
+    MPI_Alltoallv(sf.data(), sc.data(), sd.data(), dtype,
+                  rf.data(), rc.data(), rd.data(), dtype, comm);
+
+    recv_bufs.assign(comm_size, {});
+    for (int r = 0; r < comm_size; ++r)
+        recv_bufs[r].assign(rf.begin() + rd[r], rf.begin() + rd[r] + rc[r]);
+}
+
+} // namespace dqb_detail
+
+
+// ---------------------------------------------------------------------------
+// DistributedQueryBenchmark
+// ---------------------------------------------------------------------------
 
 class DistributedQueryBenchmark {
 public:
-    int rank;
-    int comm_size;
+    int rank      = 0;
+    int comm_size = 1;
 
-    int num_shards;
-    int dim;
-    int num_neighbors;
+    int num_shards    = 1;
+    int dim           = 0;
+    int num_neighbors = 10;
 
-    PointSet shard_points;
-    std::vector<int> partition;
+    PointSet          shard_points;
+    std::vector<int>  partition;
 
-    #ifdef MIPS_DISTANCE
+#ifdef MIPS_DISTANCE
     using SpaceT = hnswlib::InnerProductSpace;
-    #else
+#else
     using SpaceT = hnswlib::L2Space;
-    #endif
+#endif
 
-    std::unique_ptr<SpaceT> space;
-    std::unique_ptr<hnswlib::HierarchicalNSW<float>> hnsw;
-    std::unique_ptr<HNSWRouter> router;
+    std::unique_ptr<SpaceT>                             space;
+    std::unique_ptr<hnswlib::HierarchicalNSW<float>>    hnsw;
+    std::unique_ptr<HNSWRouter>                         router;
     HNSWParameters hnsw_parameters;
+
     int num_voting_neighbors = 250;
-    int num_probes = 2;
+    int num_probes           = 2;
 
     DistributedQueryBenchmark() {
         MPI_Comm_rank(MPI_COMM_WORLD, &rank);
         MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
     }
 
+    // -----------------------------------------------------------------------
+
     void LoadPartition(const std::string& partition_file) {
-        partition = ReadMetisPartition(partition_file);
+        partition  = ReadMetisPartition(partition_file);
         num_shards = NumPartsInPartition(partition);
     }
 
     void LoadShardPointSet(const std::string& point_set_file) {
         size_t num_points_in_shard = 0;
         for (const auto& part : partition) {
-            if (part == rank) {
-                num_points_in_shard++;
-            }
+            if (part == rank) ++num_points_in_shard;
         }
 
-        uint32_t n, d;
+        uint32_t n = 0, d = 0;
         size_t offset = 0;
 
         std::ifstream in(point_set_file, std::ios::binary);
@@ -65,19 +112,19 @@ public:
         shard_points.n = num_points_in_shard;
         shard_points.d = d;
         shard_points.coordinates.resize(shard_points.n * shard_points.d);
-        dim = d;
+        dim = (int)d;
 
         size_t coords_end = 0;
         for (uint32_t point_id = 0; point_id < n; ++point_id) {
             if (partition[point_id] == rank) {
-                size_t begin = offset + point_id * d * sizeof(float);
+                size_t begin = offset + (size_t)point_id * d * sizeof(float);
                 size_t range_length = 0;
                 for ( ; point_id < n && partition[point_id] == rank; ++point_id) {
-                    range_length += 1;
+                    ++range_length;
                 }
-
-                in.seekg(begin);
-                in.read(reinterpret_cast<char*>(&shard_points.coordinates[coords_end]), range_length * d * sizeof(float));
+                in.seekg((std::streamoff)begin);
+                in.read(reinterpret_cast<char*>(&shard_points.coordinates[coords_end]),
+                        (std::streamsize)(range_length * d * sizeof(float)));
                 coords_end += range_length * d;
             }
         }
@@ -85,126 +132,107 @@ public:
 
     void BuildInShardIndex() {
         space = std::make_unique<SpaceT>(dim);
-        hnsw = std::make_unique<hnswlib::HierarchicalNSW<float>>(space.get(), shard_points.n, hnsw_parameters.M, hnsw_parameters.ef_construction, /* random seed = */ 555);
-        parlay::parallel_for(0, shard_points.n, [&](size_t i) { hnsw->addPoint(shard_points.GetPoint(i), i); });
+        hnsw  = std::make_unique<hnswlib::HierarchicalNSW<float>>(
+            space.get(), shard_points.n,
+            hnsw_parameters.M, hnsw_parameters.ef_construction,
+            /* random seed = */ 555);
+        parlay::parallel_for(0, shard_points.n, [&](size_t i) {
+            hnsw->addPoint(shard_points.GetPoint(i), i);
+        });
         hnsw->setEf(hnsw_parameters.ef_search);
-        shard_points.Drop();    // TODO we could do the HNSW insert during IO --> halve the memory requirement
+        shard_points.Drop();
     }
 
     void LoadRouter(const std::string& hnsw_router_file) {
         router = std::make_unique<HNSWRouter>(hnsw_router_file, dim, partition);
     }
 
+    // -----------------------------------------------------------------------
+    // Route a single query vector; returns at most num_probes shard IDs.
     std::vector<int> Route(float* Q) {
         std::vector<int> probes = router->Query(Q, num_voting_neighbors).RoutingQuery();
-        probes.resize(std::min<int>(probes.size(), num_probes));
+        if ((int)probes.size() > num_probes)
+            probes.resize(num_probes);
         return probes;
     }
 
-    void ProcessQueries3(const std::vector<int>& query_ids, PointSet& queries) {
-        message_queue::FlushStrategy flush_strategy = message_queue::FlushStrategy::global;
+    // -----------------------------------------------------------------------
+    // Distributed query processing via MPI_Alltoallv (two-phase fan-out/fan-in).
+    //
+    // Each rank owns a disjoint slice of query_ids.  The method:
+    //   1. Routes each query to target shards.
+    //   2. Alltoallv fan-out: sends (query_id, query_vector) to target ranks.
+    //   3. Each rank runs searchKnn on its local HNSW for received queries.
+    //   4. Alltoallv fan-in: returns (query_id, neighbor_ids, distances) to owners.
+    //
+    // Results are collected but not further processed here; the caller measures
+    // wall-clock time end-to-end.
+    void ProcessQueries(const std::vector<int>& query_ids, PointSet& queries) {
+        using namespace dqb_detail;
 
-        struct Request {
-            int query_id = -1;
-            std::vector<float> coordinates;
-        };
-        auto merge_requests = [](auto& buf, message_queue::PEID buffer_destination, message_queue::PEID my_rank,
-                    message_queue::Envelope auto msg) {
-            buf.push_back(static_cast<float>(msg.message.query_id));
-            for (float x : msg.message.coordinates) {
-                buf.push_back(x);
-            }
-        };
+        // ------------------------------------------------------------------
+        // Phase 1 fan-out: build per-shard send buffers.
+        // ------------------------------------------------------------------
+        std::vector<std::vector<uint32_t>> send_qids(comm_size);
+        std::vector<std::vector<float>>    send_qvecs(comm_size);
 
-        auto split_requests = [](message_queue::MPIBuffer<float> auto const& buf, message_queue::PEID buffer_origin,
-                    message_queue::PEID my_rank) {
-            std::vector<Request> incoming_requests;
-            Request r;
-
-            return incoming_requests;
-        };
-
-        auto requests_queue =
-                message_queue::make_buffered_queue<Request, float>(MPI_COMM_WORLD, merge_requests, split_requests);
-
-
-        struct Response {
-            int query_id;
-            std::vector<int> neighbors;
-        };
-        auto responses_queue =
-                message_queue::make_buffered_queue<Response, int>();
-
-        std::vector<int> local_requests;
-        std::vector<std::vector<float>> request_buffers(comm_size);
-
-        // we want to
-        // a) process queries in parallel
-        // b) dont lock message buffers to avoid overheads
-        // c) get the first requests out as soon as possible so that a machine that runs out of routing
-        //    work can get started on retrieving neighbors right away
-        // The following performs multiple steps with 2^^i queries routed in step i, followed by sending their messages
-
-        size_t step_size = 128;
-        auto qq = parlay::make_slice(query_ids);
-        for (size_t i = 0; i < query_ids.size(); i += step_size, step_size *= 2) {
-            const auto queries_this_step = qq.cut(i, std::min(query_ids.size(), i + step_size));
-            auto probes_nested = parlay::map(queries_this_step, [&](int query_id) { return Route(queries.GetPoint(query_id)); });
-            //auto probes = parlay::flatten(probes_nested); // no point in doing the zip and flatten in parallel. we have to post messages sequentially anyway
-            // well actually, merging the embedding streams in parallel could be nice
-            for (size_t j = 0; j < queries_this_step.size(); ++j) {
-                int query_id = queries_this_step[j];
-                float* Q = queries.GetPoint(query_id);
-                for (int shard_id : probes_nested[j]) {
-                    if (shard_id == rank) {
-                        local_requests.push_back(query_id);
-                    } else {
-                        auto& buf = request_buffers[shard_id];
-                        // write the query ID to the stream as a float... oh well
-                        buf.push_back(static_cast<float>(query_id));
-                        // write the query vector
-                        for (int k = 0; k < dim; ++k) {
-                            buf.push_back(Q[k]);
-                        }
-                    }
-                }
-            }
-
-            for (int j = 0; j < comm_size; ++j) {
-                if (j != rank) {
-                    requests_queue.post_message(std::move(request_buffers[j]), j);
-                    // TODO flush the buffer queue
-                    request_buffers[j].clear();
-                }
+        for (int qid : query_ids) {
+            float* Q = queries.GetPoint(qid);
+            for (int shard : Route(Q)) {
+                send_qids[shard].push_back((uint32_t)qid);
+                send_qvecs[shard].insert(send_qvecs[shard].end(), Q, Q + dim);
             }
         }
 
-        auto return_neighbors = [&](message_queue::Envelope<Request> auto request_envelope) {
-            for (const Request& r : request_envelope.message) {
-                int original_sender = request_envelope.sender;
-                auto result = hnsw->searchKnn(queries.GetPoint(r.query_id), num_neighbors);
-                Response response;
-                response.query_id = r.query_id;
-                while (!result.empty()) {
-                    auto next = result.top();
-                    response.neighbors.push_back(next.second);
-                    result.pop();
-                }
-                responses_queue.post_message(std::move(response), original_sender);
+        std::vector<std::vector<uint32_t>> recv_qids;
+        std::vector<std::vector<float>>    recv_qvecs;
+        AllToAllV(send_qids,  recv_qids,  MPI_UINT32_T, comm_size, MPI_COMM_WORLD);
+        AllToAllV(send_qvecs, recv_qvecs, MPI_FLOAT,    comm_size, MPI_COMM_WORLD);
+
+        // ------------------------------------------------------------------
+        // Local HNSW search for all received queries.
+        // ------------------------------------------------------------------
+        struct QTask { int src; size_t j; uint32_t qid; };
+        std::vector<QTask> qtasks;
+        for (int src = 0; src < comm_size; ++src)
+            for (size_t j = 0; j < recv_qids[src].size(); ++j)
+                qtasks.push_back({src, j, recv_qids[src][j]});
+
+        using KNNResult = std::vector<std::pair<float, hnswlib::labeltype>>;
+        std::vector<KNNResult> qresults(qtasks.size());
+
+        parlay::parallel_for(0, qtasks.size(), [&](size_t ti) {
+            const auto& qt = qtasks[ti];
+            float* Q = recv_qvecs[qt.src].data() + qt.j * dim;
+            auto pq = hnsw->searchKnn(Q, num_neighbors);
+            auto& res = qresults[ti];
+            res.reserve(pq.size());
+            while (!pq.empty()) { res.push_back(pq.top()); pq.pop(); }
+        });
+
+        // ------------------------------------------------------------------
+        // Phase 2 fan-in: pack results and return to query owners.
+        // ------------------------------------------------------------------
+        std::vector<std::vector<uint32_t>> snd_rqids(comm_size);
+        std::vector<std::vector<uint32_t>> snd_rids(comm_size);
+        std::vector<std::vector<float>>    snd_rdists(comm_size);
+
+        for (size_t ti = 0; ti < qtasks.size(); ++ti) {
+            const int src = qtasks[ti].src;
+            snd_rqids[src].push_back(qtasks[ti].qid);
+            for (const auto& [dist, label] : qresults[ti]) {
+                snd_rids[src].push_back((uint32_t)label);
+                snd_rdists[src].push_back(dist);
             }
-        };
-
-        auto accept_returned_neighbors = [&](message_queue::Envelope<Response> auto response_envelope) {
-            /* Do nothing here */
-            // Dedup?
-        };
-
-        requests_queue.terminate(return_neighbors);
-        responses_queue.terminate(accept_returned_neighbors);
-
-        for (int query_id : local_requests) {
-            auto result = hnsw->searchKnn(queries.GetPoint(r.query_id), num_neighbors);
         }
+
+        std::vector<std::vector<uint32_t>> rcv_rqids, rcv_rids;
+        std::vector<std::vector<float>>    rcv_rdists;
+        AllToAllV(snd_rqids,  rcv_rqids,  MPI_UINT32_T, comm_size, MPI_COMM_WORLD);
+        AllToAllV(snd_rids,   rcv_rids,   MPI_UINT32_T, comm_size, MPI_COMM_WORLD);
+        AllToAllV(snd_rdists, rcv_rdists, MPI_FLOAT,    comm_size, MPI_COMM_WORLD);
+
+        // Results available in rcv_r* — communication round-trip complete.
+        (void)rcv_rqids; (void)rcv_rids; (void)rcv_rdists;
     }
-
 };

@@ -30,6 +30,7 @@ int main(int argc, const char* argv[]) {
     MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
 
     DistributedQueryBenchmark bench;
+    bench.num_neighbors = std::stoi(k_string);
     bench.LoadPartition(partition_file);
     bench.LoadShardPointSet(point_file);
     bench.BuildInShardIndex();
