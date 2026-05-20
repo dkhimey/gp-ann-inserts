@@ -46,7 +46,7 @@ int main(int argc, const char* argv[]) {
     bench.LoadShardPointSet(point_file);
     bench.BuildRouterFromSample(point_file);
     bench.BuildInShardIndex();
-    std::cout << "[DistributedBench] Index built.\n";
+    std::cout << "[DistributedBench] Rank " << rank << "] Index built.\n";
 
     // ── Load queries (all ranks) ──────────────────────────────────────────────────
     std::cout << "[DistributedBench] Loading queries on all ranks …\n";
