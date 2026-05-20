@@ -17,9 +17,11 @@ namespace {
 }
 
 int main(int argc, const char* argv[]) {
-    if (argc != 8) {
+    if (argc != 7) {
         std::cerr << "Usage: ./DistributedBench input-points queries ground-truth-file"
-                     " num_neighbors partition-file router-file output-file" << std::endl;
+                     " num_neighbors clusters-file output-file\n"
+                     "  clusters-file: GP partition output (<prefix>.k=P.GP)\n"
+                     "  Pass - as ground-truth-file to skip recall computation." << std::endl;
         std::abort();
     }
 
@@ -27,9 +29,8 @@ int main(int argc, const char* argv[]) {
     std::string query_file        = argv[2];
     std::string ground_truth_file = argv[3];
     std::string k_string          = argv[4];
-    std::string partition_file    = argv[5];
-    std::string router_file       = argv[6];
-    std::string output_file       = argv[7];
+    std::string clusters_file     = argv[5];
+    std::string output_file       = argv[6];
 
     MPI_Init(nullptr, nullptr);
 
@@ -40,10 +41,10 @@ int main(int argc, const char* argv[]) {
     // ── Build index once; reuse across all nprobe values ─────────────────────────
     DistributedQueryBenchmark bench;
     bench.num_neighbors = std::stoi(k_string);
-    bench.LoadPartition(partition_file);
+    bench.LoadPartitionFromClusters(clusters_file);
     bench.LoadShardPointSet(point_file);
+    bench.BuildRouterFromSample(point_file);
     bench.BuildInShardIndex();
-    bench.LoadRouter(router_file);
 
     // ── Load queries (all ranks) ──────────────────────────────────────────────────
     PointSet queries = ReadPoints(query_file);

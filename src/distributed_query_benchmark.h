@@ -41,9 +41,50 @@ public:
         MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
     }
 
+    // Load a pre-built Metis partition file (one shard ID per line).
+    // Used with Pyramid / OurPyramid, which write this file automatically.
     void LoadPartition(const std::string& partition_file) {
         partition = ReadMetisPartition(partition_file);
         num_shards = NumPartsInPartition(partition);
+    }
+
+    // Load a GP-style clusters file (one cluster per line, space-separated
+    // global point IDs). Derives the partition array internally.
+    void LoadPartitionFromClusters(const std::string& clusters_file) {
+        Clusters clusters = ReadClusters(clusters_file);
+        num_shards = static_cast<int>(clusters.size());
+
+        uint32_t max_id = 0;
+        for (const auto& c : clusters)
+            for (uint32_t id : c)
+                max_id = std::max(max_id, id);
+
+        partition.assign(max_id + 1, 0);
+        for (int s = 0; s < num_shards; s++)
+            for (uint32_t id : clusters[s])
+                partition[id] = s;
+    }
+
+    // Build the HNSW router from a random sample of the base dataset.
+    // All ranks execute this identically (same sample, same seeds) so no
+    // MPI communication is needed. Call after LoadPartition* and before
+    // BuildInShardIndex (which drops shard_points).
+    // sample_size: number of points to read; capped to dataset size.
+    void BuildRouterFromSample(const std::string& point_file,
+                               size_t sample_size = 100000) {
+        PointSet sample = ReadPoints(point_file, static_cast<int64_t>(sample_size));
+
+        // Build a partition array aligned to the sample (indices 0..sample.n-1).
+        const size_t n_sample = std::min(static_cast<size_t>(sample.n),
+                                         partition.size());
+        std::vector<int> sample_partition(partition.begin(),
+                                          partition.begin() + n_sample);
+        sample.n = static_cast<uint32_t>(n_sample);
+
+        HNSWParameters router_params;   // M=32, ef_construction=200, ef_search=250
+        router = std::make_unique<HNSWRouter>(
+            sample, num_shards, sample_partition, router_params);
+        router->Train(sample);
     }
 
     void LoadShardPointSet(const std::string& point_set_file) {
