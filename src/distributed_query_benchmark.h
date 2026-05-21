@@ -190,13 +190,12 @@ public:
     // -----------------------------------------------------------------------
     // Sweep nprobe from 1 to num_shards.  For each value:
     //   - num_warmup_rounds full pipeline passes are run untimed (cache warm-up,
-    //     MPI library warm-up).
+    //     MPI library warm-up).  Recall is computed from the last warm-up round
+    //     so that it is never included in the measured time.
     //   - num_bench_rounds timed passes are run; the minimum elapsed time
     //     (max-across-ranks per round, then min across rounds) is reported.
     //     Using the minimum follows standard throughput-benchmark practice:
     //     it reflects peak hardware performance with the least OS/scheduler noise.
-    //   - Recall is computed once from the last measurement round (results are
-    //     deterministic across rounds for a fixed HNSW).
     //
     // Routing is pre-computed once for all rounds (fixed shard ordering).
     // num_voting_neighbors must be >= num_shards so every shard gets a real
@@ -366,37 +365,40 @@ public:
             }
 
             // Warm-up rounds: run the full pipeline untimed.
-            for (int r = 0; r < num_warmup_rounds; ++r)
-                run_one_pass(send_qids, send_qvecs, /*want_neighbors=*/false);
+            // The last warm-up round retrieves neighbors so recall can be
+            // computed here — before any timed measurement begins.
+            double recall = -1.0;
+            for (int r = 0; r < num_warmup_rounds; ++r) {
+                const bool last = (r == num_warmup_rounds - 1);
+                auto [unused_t, warmup_neighbors] =
+                    run_one_pass(send_qids, send_qvecs,
+                                 /*want_neighbors=*/last && has_gt);
 
-            // Measurement rounds: collect per-round max elapsed, keep minimum.
-            double min_t = std::numeric_limits<double>::max();
-            std::vector<NNVec> final_neighbors;
-            for (int r = 0; r < num_bench_rounds; ++r) {
-                const bool last = (r == num_bench_rounds - 1);
-                auto [max_t, neighbors] =
-                    run_one_pass(send_qids, send_qvecs, /*want_neighbors=*/last);
-                min_t = std::min(min_t, max_t);
-                if (last) final_neighbors = std::move(neighbors);
+                if (last && has_gt) {
+                    // Compute recall@num_neighbors from warm-up results.
+                    // A returned neighbor counts as a hit if its ID appears in
+                    // the sorted ground-truth top-k set (binary search).
+                    uint64_t my_hits = 0;
+                    for (size_t q = qs; q < qe; ++q) {
+                        const auto& ids = gt_ids[q];
+                        for (const auto& [dist, id] : warmup_neighbors[q])
+                            if (std::binary_search(ids.begin(), ids.end(), id))
+                                ++my_hits;
+                    }
+                    uint64_t total_hits = 0;
+                    MPI_Reduce(&my_hits, &total_hits, 1, MPI_UINT64_T,
+                               MPI_SUM, 0, MPI_COMM_WORLD);
+                    if (rank == 0)
+                        recall = (double)total_hits / ((double)nq * num_neighbors);
+                }
             }
 
-            // Compute recall once from the last measurement round's results.
-            // A returned neighbor counts as a hit if its ID appears in the
-            // ground-truth top-k set (binary search on the sorted ID array).
-            double recall = -1.0;
-            if (has_gt) {
-                uint64_t my_hits = 0;
-                for (size_t q = qs; q < qe; ++q) {
-                    const auto& ids = gt_ids[q];
-                    for (const auto& [dist, id] : final_neighbors[q])
-                        if (std::binary_search(ids.begin(), ids.end(), id))
-                            ++my_hits;
-                }
-                uint64_t total_hits = 0;
-                MPI_Reduce(&my_hits, &total_hits, 1, MPI_UINT64_T,
-                           MPI_SUM, 0, MPI_COMM_WORLD);
-                if (rank == 0)
-                    recall = (double)total_hits / ((double)nq * num_neighbors);
+            // Measurement rounds: timed, no neighbor merge needed.
+            double min_t = std::numeric_limits<double>::max();
+            for (int r = 0; r < num_bench_rounds; ++r) {
+                auto [max_t, unused_n] =
+                    run_one_pass(send_qids, send_qvecs, /*want_neighbors=*/false);
+                min_t = std::min(min_t, max_t);
             }
 
             results.push_back({nprobe, min_t, recall});
