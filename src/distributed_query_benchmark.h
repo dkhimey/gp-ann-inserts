@@ -92,7 +92,7 @@ public:
     // and the minimum elapsed time is reported (minimum = least OS noise,
     // standard practice for throughput benchmarks).
     int num_warmup_rounds = 1;
-    int num_bench_rounds  = 3;
+    int num_bench_rounds  = 10;
 
     DistributedQueryBenchmark() {
         MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -241,7 +241,7 @@ public:
     // recall is meaningful only on rank 0; -1.0 means GT was unavailable.
     struct SearchResult {
         int    nprobe;
-        double avg_elapsed;  // avg across bench rounds (max across ranks each round)
+        double min_elapsed;  // min across bench rounds (max across ranks each round)
         double recall;       // recall@num_neighbors, or -1.0
     };
 
@@ -457,15 +457,14 @@ public:
             }
 
             // Measurement rounds: timed, no neighbor merge needed.
-            double sum_t = 0.0;
+            double min_t = std::numeric_limits<double>::max();
             for (int r = 0; r < num_bench_rounds; ++r) {
                 auto [max_t, unused_n] =
                     run_one_pass(nprobe, /*want_neighbors=*/false);
-                sum_t += max_t;
+                min_t = std::min(min_t, max_t);
             }
-            const double avg_t = sum_t / num_bench_rounds;
 
-            results.push_back({nprobe, avg_t, recall});
+            results.push_back({nprobe, min_t, recall});
         }
 
         return results;
