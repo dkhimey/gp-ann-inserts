@@ -94,11 +94,13 @@ int main(int argc, const char* argv[]) {
     if (rank == 0) {
         std::cout.clear();
         std::cout << "DistributedBench\n"
-                  << "  ranks        : " << comm_size << "\n"
-                  << "  queries      : " << queries.n << "\n"
-                  << "  num_neighbors: " << num_neighbors << "\n"
-                  << "  gt file      : " << ground_truth_file << "\n"
-                  << "  output       : " << output_file << "\n"
+                  << "  ranks         : " << comm_size << "\n"
+                  << "  queries       : " << queries.n << "\n"
+                  << "  num_neighbors : " << num_neighbors << "\n"
+                  << "  warmup rounds : " << bench.num_warmup_rounds << "\n"
+                  << "  bench rounds  : " << bench.num_bench_rounds << "\n"
+                  << "  gt file       : " << ground_truth_file << "\n"
+                  << "  output        : " << output_file << "\n"
                   << "  sweeping nprobe 1.." << comm_size << "\n\n";
     }
 
@@ -129,16 +131,16 @@ int main(int argc, const char* argv[]) {
         const bool has_gt = !ground_truth_file.empty() &&
                             std::filesystem::exists(ground_truth_file);
         for (const auto& r : sweep) {
-            const double qps = r.elapsed > 0
-                               ? (double)queries.n / r.elapsed : 0.0;
+            const double qps = r.min_elapsed > 0
+                               ? (double)queries.n / r.min_elapsed : 0.0;
             std::cout << "nprobe=" << r.nprobe
-                      << "  time=" << r.elapsed << " s"
+                      << "  time=" << r.min_elapsed << " s"
                       << "  QPS=" << qps;
             if (has_gt)
                 std::cout << "  recall@" << num_neighbors << "=" << r.recall;
             std::cout << "\n";
 
-            csv << r.nprobe << "," << r.elapsed << "," << qps << ",";
+            csv << r.nprobe << "," << r.min_elapsed << "," << qps << ",";
             if (has_gt) csv << r.recall; else csv << "N/A";
             csv << "\n";
         }

@@ -85,6 +85,14 @@ public:
     int num_voting_neighbors = 250;
     int num_probes           = 2;
 
+    // Benchmarking rounds.
+    // One warm-up pass is run before timing to bring HNSW graph data into
+    // cache and let MPI settle.  Then num_bench_rounds timed passes are run
+    // and the minimum elapsed time is reported (minimum = least OS noise,
+    // standard practice for throughput benchmarks).
+    int num_warmup_rounds = 1;
+    int num_bench_rounds  = 3;
+
     DistributedQueryBenchmark() {
         MPI_Comm_rank(MPI_COMM_WORLD, &rank);
         MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
@@ -175,17 +183,24 @@ public:
     // recall is meaningful only on rank 0; -1.0 means GT was unavailable.
     struct SearchResult {
         int    nprobe;
-        double elapsed;   // wall-clock seconds (max across ranks)
-        double recall;    // recall@num_neighbors, or -1.0
+        double min_elapsed;  // min across bench rounds (max across ranks each round)
+        double recall;       // recall@num_neighbors, or -1.0
     };
 
     // -----------------------------------------------------------------------
-    // Sweep nprobe from 1 to num_shards and measure time + recall at each
-    // value.  Mirrors ProcessSearchSweep in distributed_insert_bench_sweep.cpp.
+    // Sweep nprobe from 1 to num_shards.  For each value:
+    //   - num_warmup_rounds full pipeline passes are run untimed (cache warm-up,
+    //     MPI library warm-up).
+    //   - num_bench_rounds timed passes are run; the minimum elapsed time
+    //     (max-across-ranks per round, then min across rounds) is reported.
+    //     Using the minimum follows standard throughput-benchmark practice:
+    //     it reflects peak hardware performance with the least OS/scheduler noise.
+    //   - Recall is computed once from the last measurement round (results are
+    //     deterministic across rounds for a fixed HNSW).
     //
-    // Routing is computed once per query (full shard ordering).
-    // num_voting_neighbors should be >= num_shards so every shard gets a real
-    // distance estimate — call set_voting_neighbors_for_sweep() before this.
+    // Routing is pre-computed once for all rounds (fixed shard ordering).
+    // num_voting_neighbors must be >= num_shards so every shard gets a real
+    // distance estimate across the full sweep.
     //
     // gt_file may be empty or non-existent; recall is then reported as -1.0.
     std::vector<SearchResult> ProcessSearchSweep(PointSet& queries,
@@ -198,7 +213,7 @@ public:
         const size_t qe    = std::min(nq, qs + chunk);
 
         // ------------------------------------------------------------------
-        // Pre-compute full shard ordering for every query in this rank's chunk.
+        // Pre-compute full shard ordering once — shared across all rounds.
         // ------------------------------------------------------------------
         std::vector<std::vector<int>> routing_order(qe - qs);
         for (size_t q = qs; q < qe; ++q)
@@ -222,27 +237,19 @@ public:
         }
 
         // ------------------------------------------------------------------
-        // Sweep nprobe = 1 .. num_shards.
+        // Helper: run one complete fan-out/search/fan-in pass for a given set
+        // of pre-built send buffers.  Returns (max_elapsed_across_ranks,
+        // neighbors_per_query).  neighbors is populated only when
+        // want_neighbors=true (skip on warm-up rounds to save merge cost).
         // ------------------------------------------------------------------
-        std::vector<SearchResult> results;
-        results.reserve(num_shards);
+        const int total_rounds = num_warmup_rounds + num_bench_rounds;
 
-        for (int nprobe = 1; nprobe <= num_shards; ++nprobe) {
-
-            // Build per-shard send buffers using the top-nprobe shards.
-            std::vector<std::vector<uint32_t>> send_qids(comm_size);
-            std::vector<std::vector<float>>    send_qvecs(comm_size);
-            for (size_t q = qs; q < qe; ++q) {
-                float* Q = queries.GetPoint(q);
-                const auto& order = routing_order[q - qs];
-                const int np = std::min(nprobe, (int)order.size());
-                for (int pi = 0; pi < np; ++pi) {
-                    const int s = order[pi];
-                    send_qids[s].push_back((uint32_t)q);
-                    send_qvecs[s].insert(send_qvecs[s].end(), Q, Q + dim);
-                }
-            }
-
+        auto run_one_pass = [&](
+            const std::vector<std::vector<uint32_t>>& send_qids,
+            const std::vector<std::vector<float>>&    send_qvecs,
+            bool want_neighbors)
+            -> std::pair<double, std::vector<NNVec>>
+        {
             MPI_Barrier(MPI_COMM_WORLD);
             const double t0 = MPI_Wtime();
 
@@ -268,12 +275,12 @@ public:
                 auto& res = qresults[ti];
                 res.reserve(num_neighbors);
                 while (!pq.empty()) { res.push_back(pq.top()); pq.pop(); }
-                // Pad to num_neighbors so the fan-in stride is always fixed.
+                // Pad so the fan-in stride is always exactly num_neighbors.
                 while ((int)res.size() < num_neighbors)
                     res.push_back({std::numeric_limits<float>::max(), 0});
             });
 
-            // Pack results: one row per (shard_src, query) pair.
+            // Pack results for return.
             std::vector<std::vector<uint32_t>> snd_rqids(comm_size);
             std::vector<std::vector<uint32_t>> snd_rids(comm_size);
             std::vector<std::vector<float>>    snd_rdists(comm_size);
@@ -297,36 +304,77 @@ public:
             double max_t = 0.0;
             MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
-            // Merge per-shard results into a single top-k list per query.
-            std::vector<NNVec> neighbors(nq);
-            for (int src = 0; src < comm_size; ++src) {
-                const size_t nres = rcv_rqids[src].size();
-                for (size_t j = 0; j < nres; ++j) {
-                    const uint32_t qid = rcv_rqids[src][j];
-                    for (int nn = 0; nn < num_neighbors; ++nn)
-                        neighbors[qid].push_back({
-                            rcv_rdists[src][j * num_neighbors + nn],
-                            rcv_rids[src][j * num_neighbors + nn]});
+            // Merge results only when the caller needs them (measurement rounds).
+            std::vector<NNVec> neighbors;
+            if (want_neighbors) {
+                neighbors.resize(nq);
+                for (int src = 0; src < comm_size; ++src) {
+                    const size_t nres = rcv_rqids[src].size();
+                    for (size_t j = 0; j < nres; ++j) {
+                        const uint32_t qid = rcv_rqids[src][j];
+                        for (int nn = 0; nn < num_neighbors; ++nn)
+                            neighbors[qid].push_back({
+                                rcv_rdists[src][j * num_neighbors + nn],
+                                rcv_rids[src][j * num_neighbors + nn]});
+                    }
+                }
+                for (size_t q = qs; q < qe; ++q) {
+                    auto& nv = neighbors[q];
+                    std::sort(nv.begin(), nv.end());
+                    nv.erase(std::unique(nv.begin(), nv.end(),
+                        [](const auto& a, const auto& b) {
+                            return a.second == b.second; }),
+                        nv.end());
+                    if ((int)nv.size() > num_neighbors) nv.resize(num_neighbors);
                 }
             }
-            // Sort, dedup, and trim to top-k for each query this rank owns.
+
+            return {max_t, std::move(neighbors)};
+        };
+
+        // ------------------------------------------------------------------
+        // Sweep nprobe = 1 .. num_shards.
+        // ------------------------------------------------------------------
+        std::vector<SearchResult> results;
+        results.reserve(num_shards);
+
+        for (int nprobe = 1; nprobe <= num_shards; ++nprobe) {
+
+            // Build send buffers once — reused across all rounds.
+            std::vector<std::vector<uint32_t>> send_qids(comm_size);
+            std::vector<std::vector<float>>    send_qvecs(comm_size);
             for (size_t q = qs; q < qe; ++q) {
-                auto& nv = neighbors[q];
-                std::sort(nv.begin(), nv.end());
-                nv.erase(std::unique(nv.begin(), nv.end(),
-                    [](const auto& a, const auto& b) {
-                        return a.second == b.second; }),
-                    nv.end());
-                if ((int)nv.size() > num_neighbors) nv.resize(num_neighbors);
+                float* Q = queries.GetPoint(q);
+                const auto& order = routing_order[q - qs];
+                const int np = std::min(nprobe, (int)order.size());
+                for (int pi = 0; pi < np; ++pi) {
+                    const int s = order[pi];
+                    send_qids[s].push_back((uint32_t)q);
+                    send_qvecs[s].insert(send_qvecs[s].end(), Q, Q + dim);
+                }
             }
 
-            // Compute recall: each rank counts hits in its own query slice,
-            // then reduce-sum to rank 0.
+            // Warm-up rounds: run the full pipeline untimed.
+            for (int r = 0; r < num_warmup_rounds; ++r)
+                run_one_pass(send_qids, send_qvecs, /*want_neighbors=*/false);
+
+            // Measurement rounds: collect per-round max elapsed, keep minimum.
+            double min_t = std::numeric_limits<double>::max();
+            std::vector<NNVec> final_neighbors;
+            for (int r = 0; r < num_bench_rounds; ++r) {
+                const bool last = (r == num_bench_rounds - 1);
+                auto [max_t, neighbors] =
+                    run_one_pass(send_qids, send_qvecs, /*want_neighbors=*/last);
+                min_t = std::min(min_t, max_t);
+                if (last) final_neighbors = std::move(neighbors);
+            }
+
+            // Compute recall once from the last measurement round's results.
             double recall = -1.0;
             if (has_gt) {
                 uint64_t my_hits = 0;
                 for (size_t q = qs; q < qe; ++q)
-                    for (const auto& [dist, id] : neighbors[q])
+                    for (const auto& [dist, id] : final_neighbors[q])
                         if (dist <= dist_kth[q]) ++my_hits;
                 uint64_t total_hits = 0;
                 MPI_Reduce(&my_hits, &total_hits, 1, MPI_UINT64_T,
@@ -335,7 +383,7 @@ public:
                     recall = (double)total_hits / ((double)nq * num_neighbors);
             }
 
-            results.push_back({nprobe, max_t, recall});
+            results.push_back({nprobe, min_t, recall});
         }
 
         return results;
