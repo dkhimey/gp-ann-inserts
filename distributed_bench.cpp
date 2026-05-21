@@ -71,7 +71,9 @@ int main(int argc, const char* argv[]) {
     bench.num_neighbors = num_neighbors;
     // Set num_voting_neighbors high enough that every shard gets a real
     // distance estimate for all nprobe values across the sweep.
-    bench.num_voting_neighbors = comm_size;
+    // Use 10 * comm_size voting neighbors so every shard gets a real distance
+    // estimate for all nprobe values in the sweep (matches reference benchmark).
+    bench.num_voting_neighbors = 10 * comm_size;
 
     double t_setup = MPI_Wtime();
     std::cerr << "[rank " << rank << "] loading partition\n";

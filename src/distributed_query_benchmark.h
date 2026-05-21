@@ -106,6 +106,10 @@ public:
         // WriteMetisPartition.  ReadMetisPartition would parse the cluster
         // member IDs as shard labels and produce nonsense.
         Clusters clusters = ReadClusters(partition_file);
+        // ReadClusters adds an empty entry for each trailing newline in the
+        // file.  Strip those so num_shards matches the actual shard count.
+        while (!clusters.empty() && clusters.back().empty())
+            clusters.pop_back();
         num_shards = (int)clusters.size();
 
         // Find the total number of base points so we can size the array.
@@ -127,14 +131,33 @@ public:
             if (part == rank) ++num_points_in_shard;
         }
 
+        // Determine the on-disk element size from the file extension.
+        // .fbin  → float32  (elem_bytes = 4, no conversion needed)
+        // .u8bin → uint8    (elem_bytes = 1, cast to float on read)
+        // .i8bin → int8     (elem_bytes = 1, cast to float on read)
+        const bool is_float =
+            point_set_file.size() >= 5 &&
+            point_set_file.substr(point_set_file.size() - 5) == ".fbin";
+        const bool is_u8 =
+            point_set_file.size() >= 6 &&
+            point_set_file.substr(point_set_file.size() - 6) == ".u8bin";
+        const bool is_i8 =
+            point_set_file.size() >= 6 &&
+            point_set_file.substr(point_set_file.size() - 6) == ".i8bin";
+        if (!is_float && !is_u8 && !is_i8)
+            throw std::runtime_error(
+                "LoadShardPointSet: unsupported format for '" + point_set_file +
+                "'. Use .fbin, .u8bin, or .i8bin.");
+        const size_t elem_bytes = is_float ? sizeof(float) : sizeof(uint8_t);
+
         uint32_t n = 0, d = 0;
-        size_t offset = 0;
+        size_t header_bytes = 0;
 
         std::ifstream in(point_set_file, std::ios::binary);
         in.read(reinterpret_cast<char*>(&n), sizeof(uint32_t));
-        offset += sizeof(uint32_t);
+        header_bytes += sizeof(uint32_t);
         in.read(reinterpret_cast<char*>(&d), sizeof(uint32_t));
-        offset += sizeof(uint32_t);
+        header_bytes += sizeof(uint32_t);
 
         shard_points.n = num_points_in_shard;
         shard_points.d = d;
@@ -149,15 +172,37 @@ public:
         size_t coords_end = 0;
         for (uint32_t point_id = 0; point_id < n; ++point_id) {
             if (partition[point_id] == rank) {
-                size_t begin = offset + (size_t)point_id * d * sizeof(float);
+                // Seek using the on-disk element size, not sizeof(float).
+                const size_t file_offset =
+                    header_bytes + (size_t)point_id * d * elem_bytes;
                 size_t range_length = 0;
                 for ( ; point_id < n && partition[point_id] == rank; ++point_id) {
                     shard_point_ids.push_back(point_id);
                     ++range_length;
                 }
-                in.seekg((std::streamoff)begin);
-                in.read(reinterpret_cast<char*>(&shard_points.coordinates[coords_end]),
-                        (std::streamsize)(range_length * d * sizeof(float)));
+                in.seekg((std::streamoff)file_offset);
+
+                if (is_float) {
+                    // Float32: read directly into the coordinates vector.
+                    in.read(reinterpret_cast<char*>(
+                                &shard_points.coordinates[coords_end]),
+                            (std::streamsize)(range_length * d * sizeof(float)));
+                } else if (is_u8) {
+                    // Uint8: read into a temporary buffer and cast to float.
+                    std::vector<uint8_t> buf(range_length * d);
+                    in.read(reinterpret_cast<char*>(buf.data()),
+                            (std::streamsize)(range_length * d));
+                    for (size_t k = 0; k < buf.size(); ++k)
+                        shard_points.coordinates[coords_end + k] =
+                            static_cast<float>(buf[k]);
+                } else { // is_i8
+                    std::vector<int8_t> buf(range_length * d);
+                    in.read(reinterpret_cast<char*>(buf.data()),
+                            (std::streamsize)(range_length * d));
+                    for (size_t k = 0; k < buf.size(); ++k)
+                        shard_points.coordinates[coords_end + k] =
+                            static_cast<float>(buf[k]);
+                }
                 coords_end += range_length * d;
             }
         }
@@ -165,8 +210,10 @@ public:
 
     void BuildInShardIndex() {
         space = std::make_unique<SpaceT>(dim);
+        // Add 1 to capacity: hnswlib can have off-by-one issues when
+        // max_elements == cur_element_count during the last insertion.
         hnsw  = std::make_unique<hnswlib::HierarchicalNSW<float>>(
-            space.get(), shard_points.n,
+            space.get(), shard_points.n + 1,
             hnsw_parameters.M, hnsw_parameters.ef_construction,
             /* random seed = */ 555);
         parlay::parallel_for(0, shard_points.n, [&](size_t i) {
@@ -175,6 +222,8 @@ public:
             hnsw->addPoint(shard_points.GetPoint(i), shard_point_ids[i]);
         });
         hnsw->setEf(hnsw_parameters.ef_search);
+        std::cerr << "[rank " << rank << "] HNSW built: "
+                  << hnsw->cur_element_count << " elements, dim=" << dim << "\n";
         shard_points.Drop();
     }
 
