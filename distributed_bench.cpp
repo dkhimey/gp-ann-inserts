@@ -133,16 +133,16 @@ int main(int argc, const char* argv[]) {
         const bool has_gt = !ground_truth_file.empty() &&
                             std::filesystem::exists(ground_truth_file);
         for (const auto& r : sweep) {
-            const double qps = r.min_elapsed > 0
-                               ? (double)queries.n / r.min_elapsed : 0.0;
+            const double qps = r.avg_elapsed > 0
+                               ? (double)queries.n / r.avg_elapsed : 0.0;
             std::cout << "nprobe=" << r.nprobe
-                      << "  time=" << r.min_elapsed << " s"
+                      << "  time=" << r.avg_elapsed << " s"
                       << "  QPS=" << qps;
             if (has_gt)
                 std::cout << "  recall@" << num_neighbors << "=" << r.recall;
             std::cout << "\n";
 
-            csv << r.nprobe << "," << r.min_elapsed << "," << qps << ",";
+            csv << r.nprobe << "," << r.avg_elapsed << "," << qps << ",";
             if (has_gt) csv << r.recall; else csv << "N/A";
             csv << "\n";
         }

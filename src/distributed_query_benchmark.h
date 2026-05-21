@@ -241,7 +241,7 @@ public:
     // recall is meaningful only on rank 0; -1.0 means GT was unavailable.
     struct SearchResult {
         int    nprobe;
-        double min_elapsed;  // min across bench rounds (max across ranks each round)
+        double avg_elapsed;  // avg across bench rounds (max across ranks each round)
         double recall;       // recall@num_neighbors, or -1.0
     };
 
@@ -452,14 +452,15 @@ public:
             }
 
             // Measurement rounds: timed, no neighbor merge needed.
-            double min_t = std::numeric_limits<double>::max();
+            double sum_t = 0.0;
             for (int r = 0; r < num_bench_rounds; ++r) {
                 auto [max_t, unused_n] =
                     run_one_pass(send_qids, send_qvecs, /*want_neighbors=*/false);
-                min_t = std::min(min_t, max_t);
+                sum_t += max_t;
             }
+            const double avg_t = sum_t / num_bench_rounds;
 
-            results.push_back({nprobe, min_t, recall});
+            results.push_back({nprobe, avg_t, recall});
         }
 
         return results;

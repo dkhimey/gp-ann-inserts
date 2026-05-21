@@ -116,9 +116,9 @@ NNVec ConvertTopKToNNVec(TopN& top_k);
 TopN ClosestLeaders(PointSet& points, PointSet& leader_points, uint32_t my_id, int k);
 
 struct HNSWParameters {
-    size_t M = 32;
+    size_t M = 16;
     size_t ef_construction = 200;
-    size_t ef_search = 250;
+    size_t ef_search = 200;
 };
 
 using Duration = std::chrono::duration<double>;
