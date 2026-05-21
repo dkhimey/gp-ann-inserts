@@ -221,18 +221,29 @@ public:
                 router->Query(queries.GetPoint(q), num_voting_neighbors).RoutingQuery();
 
         // ------------------------------------------------------------------
-        // Load GT and compute per-query kth-distance threshold for recall.
+        // Load GT: build per-query sorted ID sets for recall@k.
+        //
+        // ID-based recall is used (not distance-based) because some ground
+        // truth files (e.g. big-ann-benchmarks .ibin) store only neighbor IDs
+        // with no distances.  ReadGroundTruth reads IDs correctly from both
+        // formats; distances from ID-only files would be zero/garbage and
+        // produce recall = 0 when used as thresholds.
+        //
+        // gt_ids[q] holds the sorted top-num_neighbors true neighbor IDs for
+        // query q.  Sorted so membership can be checked with binary search.
         // ------------------------------------------------------------------
         const bool has_gt = !gt_file.empty() &&
                             std::filesystem::exists(gt_file);
-        std::vector<float> dist_kth(nq, std::numeric_limits<float>::max());
+        std::vector<std::vector<uint32_t>> gt_ids(nq);
         if (has_gt) {
             auto gt = ReadGroundTruth(gt_file);
             for (size_t q = 0; q < nq; ++q) {
-                auto sorted = gt[q];
-                std::sort(sorted.begin(), sorted.end());
-                if ((int)sorted.size() >= num_neighbors)
-                    dist_kth[q] = sorted[num_neighbors - 1].first;
+                auto& ids = gt_ids[q];
+                const int k = std::min<int>(num_neighbors, (int)gt[q].size());
+                ids.reserve(k);
+                for (int j = 0; j < k; ++j)
+                    ids.push_back(gt[q][j].second);
+                std::sort(ids.begin(), ids.end());
             }
         }
 
@@ -370,12 +381,17 @@ public:
             }
 
             // Compute recall once from the last measurement round's results.
+            // A returned neighbor counts as a hit if its ID appears in the
+            // ground-truth top-k set (binary search on the sorted ID array).
             double recall = -1.0;
             if (has_gt) {
                 uint64_t my_hits = 0;
-                for (size_t q = qs; q < qe; ++q)
+                for (size_t q = qs; q < qe; ++q) {
+                    const auto& ids = gt_ids[q];
                     for (const auto& [dist, id] : final_neighbors[q])
-                        if (dist <= dist_kth[q]) ++my_hits;
+                        if (std::binary_search(ids.begin(), ids.end(), id))
+                            ++my_hits;
+                }
                 uint64_t total_hits = 0;
                 MPI_Reduce(&my_hits, &total_hits, 1, MPI_UINT64_T,
                            MPI_SUM, 0, MPI_COMM_WORLD);
