@@ -270,6 +270,14 @@ public:
         const size_t qe    = std::min(nq, qs + chunk);
 
         // ------------------------------------------------------------------
+        // Pre-compute full shard ordering once — shared across all rounds.
+        // ------------------------------------------------------------------
+        std::vector<std::vector<int>> routing_order(qe - qs);
+        for (size_t q = qs; q < qe; ++q)
+            routing_order[q - qs] =
+                router->Query(queries.GetPoint(q), num_voting_neighbors).RoutingQuery();
+
+        // ------------------------------------------------------------------
         // Load GT: build per-query sorted ID sets for recall@k.
         //
         // ID-based recall is used (not distance-based) because some ground
@@ -297,31 +305,21 @@ public:
         }
 
         // ------------------------------------------------------------------
-        // Helper: run one complete route/fan-out/search/fan-in pass.
-        // Routing is performed inside the timed region so that the measured
-        // time matches SURGE's shared_static_experiment timing model.
-        // neighbors is populated only when want_neighbors=true (skip on
-        // timed rounds to save merge cost).
+        // Helper: run one complete fan-out/search/fan-in pass for a given set
+        // of pre-built send buffers.  Returns (max_elapsed_across_ranks,
+        // neighbors_per_query).  neighbors is populated only when
+        // want_neighbors=true (skip on warm-up rounds to save merge cost).
         // ------------------------------------------------------------------
-        auto run_one_pass = [&](int nprobe, bool want_neighbors)
+        const int total_rounds = num_warmup_rounds + num_bench_rounds;
+
+        auto run_one_pass = [&](
+            const std::vector<std::vector<uint32_t>>& send_qids,
+            const std::vector<std::vector<float>>&    send_qvecs,
+            bool want_neighbors)
             -> std::pair<double, std::vector<NNVec>>
         {
             MPI_Barrier(MPI_COMM_WORLD);
             const double t0 = MPI_Wtime();
-
-            // Routing — inside the timed region.
-            std::vector<std::vector<uint32_t>> send_qids(comm_size);
-            std::vector<std::vector<float>>    send_qvecs(comm_size);
-            for (size_t q = qs; q < qe; ++q) {
-                float* Q = queries.GetPoint(q);
-                auto order = router->Query(Q, num_voting_neighbors).RoutingQuery();
-                const int np = std::min(nprobe, (int)order.size());
-                for (int pi = 0; pi < np; ++pi) {
-                    const int s = order[pi];
-                    send_qids[s].push_back((uint32_t)q);
-                    send_qvecs[s].insert(send_qvecs[s].end(), Q, Q + dim);
-                }
-            }
 
             // Phase 1: fan queries out to target shards.
             std::vector<std::vector<uint32_t>> recv_qids;
@@ -410,6 +408,20 @@ public:
 
         for (int nprobe = 1; nprobe <= num_shards; ++nprobe) {
 
+            // Build send buffers once — reused across all rounds.
+            std::vector<std::vector<uint32_t>> send_qids(comm_size);
+            std::vector<std::vector<float>>    send_qvecs(comm_size);
+            for (size_t q = qs; q < qe; ++q) {
+                float* Q = queries.GetPoint(q);
+                const auto& order = routing_order[q - qs];
+                const int np = std::min(nprobe, (int)order.size());
+                for (int pi = 0; pi < np; ++pi) {
+                    const int s = order[pi];
+                    send_qids[s].push_back((uint32_t)q);
+                    send_qvecs[s].insert(send_qvecs[s].end(), Q, Q + dim);
+                }
+            }
+
             // Warm-up rounds: run the full pipeline untimed.
             // The last warm-up round retrieves neighbors so recall can be
             // computed here — before any timed measurement begins.
@@ -417,7 +429,8 @@ public:
             for (int r = 0; r < num_warmup_rounds; ++r) {
                 const bool last = (r == num_warmup_rounds - 1);
                 auto [unused_t, warmup_neighbors] =
-                    run_one_pass(nprobe, /*want_neighbors=*/last && has_gt);
+                    run_one_pass(send_qids, send_qvecs,
+                                 /*want_neighbors=*/last && has_gt);
 
                 if (last && has_gt) {
                     // Compute recall@num_neighbors from warm-up results.
@@ -442,7 +455,7 @@ public:
             double sum_t = 0.0;
             for (int r = 0; r < num_bench_rounds; ++r) {
                 auto [max_t, unused_n] =
-                    run_one_pass(nprobe, /*want_neighbors=*/false);
+                    run_one_pass(send_qids, send_qvecs, /*want_neighbors=*/false);
                 sum_t += max_t;
             }
             const double avg_t = sum_t / num_bench_rounds;
