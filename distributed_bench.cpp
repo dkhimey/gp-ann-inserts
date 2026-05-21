@@ -71,9 +71,13 @@ int main(int argc, const char* argv[]) {
     // distance estimate for all nprobe values across the sweep.
     bench.num_voting_neighbors = comm_size;
 
+    std::cout << "Rank " << rank << ": loading partition …\n";
     bench.LoadPartition(partition_file);
+    std::cout << "Rank " << rank << ": loading shard points …\n";
     bench.LoadShardPointSet(point_file);
+    std::cout << "Rank " << rank << ": building in-shard index …\n";
     bench.BuildInShardIndex();
+    std::cout << "Rank " << rank << ": loading router …\n";
     bench.LoadRouter(router_file);
 
     PointSet queries = ReadPoints(query_file);
