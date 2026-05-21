@@ -59,11 +59,13 @@ int main(int argc, const char* argv[]) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
 
-    // Suppress ReadPoints / build chatter on non-root ranks.
+    // Suppress library-level ReadPoints / HNSW chatter on non-root ranks.
     if (rank != 0) std::cout.setstate(std::ios_base::failbit);
 
     // ------------------------------------------------------------------
     // Build the per-shard index and load the router.
+    // Per-rank progress goes to stderr so it is visible from all ranks
+    // regardless of the stdout suppression above.
     // ------------------------------------------------------------------
     DistributedQueryBenchmark bench;
     bench.num_neighbors = num_neighbors;
@@ -71,16 +73,23 @@ int main(int argc, const char* argv[]) {
     // distance estimate for all nprobe values across the sweep.
     bench.num_voting_neighbors = comm_size;
 
-    std::cout << "Rank " << rank << ": loading partition …\n";
+    double t_setup = MPI_Wtime();
+    std::cerr << "[rank " << rank << "] loading partition\n";
     bench.LoadPartition(partition_file);
-    std::cout << "Rank " << rank << ": loading shard points …\n";
+    std::cerr << "[rank " << rank << "] loading shard points\n";
     bench.LoadShardPointSet(point_file);
-    std::cout << "Rank " << rank << ": building in-shard index …\n";
+    std::cerr << "[rank " << rank << "] building in-shard HNSW\n";
     bench.BuildInShardIndex();
-    std::cout << "Rank " << rank << ": loading router …\n";
+    std::cerr << "[rank " << rank << "] loading router\n";
     bench.LoadRouter(router_file);
+    std::cerr << "[rank " << rank << "] setup done in "
+              << (MPI_Wtime() - t_setup) << " s\n";
 
     PointSet queries = ReadPoints(query_file);
+
+    // Synchronise: rank 0 must not enter the sweep until every rank has
+    // finished building its shard index.
+    MPI_Barrier(MPI_COMM_WORLD);
 
     if (rank == 0) {
         std::cout.clear();

@@ -93,8 +93,23 @@ public:
     // -----------------------------------------------------------------------
 
     void LoadPartition(const std::string& partition_file) {
-        partition  = ReadMetisPartition(partition_file);
-        num_shards = NumPartsInPartition(partition);
+        // The file is written by WriteClusters (clusters format), NOT by
+        // WriteMetisPartition.  ReadMetisPartition would parse the cluster
+        // member IDs as shard labels and produce nonsense.
+        Clusters clusters = ReadClusters(partition_file);
+        num_shards = (int)clusters.size();
+
+        // Find the total number of base points so we can size the array.
+        size_t n = 0;
+        for (const auto& c : clusters)
+            for (uint32_t id : c)
+                n = std::max(n, (size_t)(id + 1));
+
+        // Build point → shard mapping.
+        partition.assign(n, -1);
+        for (int s = 0; s < num_shards; ++s)
+            for (uint32_t id : clusters[s])
+                partition[id] = s;
     }
 
     void LoadShardPointSet(const std::string& point_set_file) {
