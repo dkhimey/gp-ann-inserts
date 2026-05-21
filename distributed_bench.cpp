@@ -1,28 +1,57 @@
-#include <mpi.h>
-#include "distributed_query_benchmark.h"
+// distributed_bench.cpp
+//
+// Pure-query throughput and recall benchmark for a static GP-ANN index.
+// One MPI rank per shard.  No inserts or deletes.
+//
+// Each rank loads its shard from the partition file, builds a local HNSW,
+// and loads the pre-built HNSW router.  Then a sweep over nprobe = 1 .. K
+// is executed: for each value the full Alltoallv fan-out/fan-in pipeline
+// is timed and recall@num_neighbors is computed against the ground-truth
+// file.
+//
+// Usage
+// -----
+//   mpirun -np <K> ./DistributedBench
+//          <input-points> <queries> <ground-truth-file>
+//          <num-neighbors> <partition-file> <router-file>
+//          [output-file]
+//
+//   K must equal the number of shards in the partition file.
+//   output-file defaults to "distributed_bench_results.csv".
+//
+// CSV columns
+// -----------
+//   nprobe, time_s, qps, recall@<K>
 
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <numeric>
+
+#include <mpi.h>
+
+#include "distributed_query_benchmark.h"
 #include "points_io.h"
 #include "metis_io.h"
 
-namespace {
-    size_t ComputeChunkSize(size_t a, size_t b) {
-        return (a+b-1) / b;
-    }
-}
-
 int main(int argc, const char* argv[]) {
-    if (argc != 7) {
-        std::cerr << "Usage ./DistributedBench input-points queries ground-truth-file num_neighbors partition-file router-file" << std::endl;
+    if (argc < 7 || argc > 8) {
+        std::cerr << "Usage: mpirun -np <K> ./DistributedBench"
+                     " <input-points> <queries> <ground-truth-file>"
+                     " <num-neighbors> <partition-file> <router-file>"
+                     " [output-file]\n";
         std::abort();
     }
 
-    std::string point_file = argv[1];
-    std::string query_file = argv[2];
-    std::string ground_truth_file = argv[3];
-    std::string k_string = argv[4];
-    int num_neighbors = std::stoi(k_string);
-    std::string partition_file = argv[5];
-    std::string router_file = argv[6];
+    const std::string point_file      = argv[1];
+    const std::string query_file      = argv[2];
+    const std::string ground_truth_file = argv[3];
+    const int         num_neighbors   = std::stoi(argv[4]);
+    const std::string partition_file  = argv[5];
+    const std::string router_file     = argv[6];
+    const std::string output_file     = (argc == 8)
+                                        ? argv[7]
+                                        : "distributed_bench_results.csv";
 
     MPI_Init(nullptr, nullptr);
 
@@ -30,82 +59,79 @@ int main(int argc, const char* argv[]) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
 
+    // Suppress ReadPoints / build chatter on non-root ranks.
+    if (rank != 0) std::cout.setstate(std::ios_base::failbit);
+
+    // ------------------------------------------------------------------
+    // Build the per-shard index and load the router.
+    // ------------------------------------------------------------------
     DistributedQueryBenchmark bench;
     bench.num_neighbors = num_neighbors;
+    // Set num_voting_neighbors high enough that every shard gets a real
+    // distance estimate for all nprobe values across the sweep.
+    bench.num_voting_neighbors = comm_size;
+
     bench.LoadPartition(partition_file);
     bench.LoadShardPointSet(point_file);
     bench.BuildInShardIndex();
     bench.LoadRouter(router_file);
 
     PointSet queries = ReadPoints(query_file);
-    std::vector<int> query_ids(queries.n);
-    std::iota(query_ids.begin(), query_ids.end(), 0);
-    size_t chunk_size = ComputeChunkSize(query_ids.size(), comm_size);
-    std::vector<int> my_query_ids(query_ids.begin() + rank * chunk_size, query_ids.begin() + std::min(query_ids.size(), (rank + 1) * chunk_size));
-
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    double t1, t2;
-    t1 = MPI_Wtime();
-    auto [rcv_rqids, rcv_rids, rcv_rdists] = bench.ProcessQueries(my_query_ids, queries);
-    t2 = MPI_Wtime();
-
-    MPI_Barrier(MPI_COMM_WORLD);    // TODO is this necessary? the subsequent MPI_Reduce should enforce a sync
-    double elapsed = t2 - t1;
-    double max_elapsed = 0.0;
-    MPI_Reduce(&elapsed, &max_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-
-    // Merge results per query (handles num_probes > 1).
-    std::vector<NNVec> neighbors(nq);
-    for (int src = 0; src < comm_size; ++src) {
-        const size_t nres = rcv_rqids[src].size();
-        for (size_t j = 0; j < nres; ++j) {
-            const uint32_t qid = rcv_rqids[src][j];
-            for (int nn = 0; nn < num_neighbors; ++nn)
-                neighbors[qid].push_back({
-                    rcv_rdists[src][j * num_neighbors + nn],
-                    rcv_rids[src][j * num_neighbors + nn] });
-        }
-    }
-    // Trim to top-k (sorted, deduped by label).
-    for (size_t q = qs; q < qe; ++q) {
-        auto& nv = neighbors[q];
-        std::sort(nv.begin(), nv.end());
-        nv.erase(std::unique(nv.begin(), nv.end(),
-            [](const auto& a, const auto& b){ return a.second == b.second; }),
-            nv.end());
-        if ((int)nv.size() > num_neighbors) nv.resize(num_neighbors);
-    }
-
-    // Recall: each rank evaluates its own query chunk; reduce sum.
-    double recall = 0.0;
-    if (!gt_file.empty() && std::filesystem::exists(gt_file)) {
-        auto gt = ReadGroundTruth(gt_file);
-        // Use distances stored in the GT file directly (no base vectors needed).
-        std::vector<float> dist_kth(nq, std::numeric_limits<float>::max());
-        for (size_t q = 0; q < nq; ++q) {
-            auto sorted = gt[q];
-            std::sort(sorted.begin(), sorted.end());
-            if ((int)sorted.size() >= num_neighbors)
-                dist_kth[q] = sorted[num_neighbors - 1].first;
-        }
-        uint64_t my_hits = 0;
-        for (size_t q = qs; q < qe; ++q)
-            for (const auto& [dist, id] : neighbors[q])
-                if (dist <= dist_kth[q]) ++my_hits;
-        uint64_t total_hits = 0;
-        MPI_Reduce(&my_hits, &total_hits, 1, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
-        if (rank == 0)
-            recall = (double)total_hits / ((double)nq * num_neighbors);
-    }
-
-    // compute recall on rank 0
 
     if (rank == 0) {
-        std::cout << "End-to-end time " << max_elapsed << std::endl;
-        std::cout << "Throughput " << (double)queries.n / max_elapsed << " qps" << std::endl;
-        if (!gt_file.empty() && std::filesystem::exists(gt_file))
-            std::cout << "Recall@" << num_neighbors << " = " << recall << std::endl;
+        std::cout.clear();
+        std::cout << "DistributedBench\n"
+                  << "  ranks        : " << comm_size << "\n"
+                  << "  queries      : " << queries.n << "\n"
+                  << "  num_neighbors: " << num_neighbors << "\n"
+                  << "  gt file      : " << ground_truth_file << "\n"
+                  << "  output       : " << output_file << "\n"
+                  << "  sweeping nprobe 1.." << comm_size << "\n\n";
+    }
+
+    // ------------------------------------------------------------------
+    // Open CSV output on rank 0.
+    // ------------------------------------------------------------------
+    std::ofstream csv;
+    if (rank == 0) {
+        csv.open(output_file);
+        if (!csv) {
+            std::cerr << "Cannot open output file: " << output_file << "\n";
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        csv << "nprobe,time_s,qps,recall@" << num_neighbors << "\n";
+    }
+
+    // ------------------------------------------------------------------
+    // Run the sweep.
+    // ------------------------------------------------------------------
+    if (rank != 0) std::cout.setstate(std::ios_base::failbit);
+    auto sweep = bench.ProcessSearchSweep(queries, ground_truth_file);
+    if (rank == 0) std::cout.clear();
+
+    // ------------------------------------------------------------------
+    // Report and write CSV (rank 0 only).
+    // ------------------------------------------------------------------
+    if (rank == 0) {
+        const bool has_gt = !ground_truth_file.empty() &&
+                            std::filesystem::exists(ground_truth_file);
+        for (const auto& r : sweep) {
+            const double qps = r.elapsed > 0
+                               ? (double)queries.n / r.elapsed : 0.0;
+            std::cout << "nprobe=" << r.nprobe
+                      << "  time=" << r.elapsed << " s"
+                      << "  QPS=" << qps;
+            if (has_gt)
+                std::cout << "  recall@" << num_neighbors << "=" << r.recall;
+            std::cout << "\n";
+
+            csv << r.nprobe << "," << r.elapsed << "," << qps << ",";
+            if (has_gt) csv << r.recall; else csv << "N/A";
+            csv << "\n";
+        }
+        csv.flush();
+        csv.close();
+        std::cout << "\nDone. Results written to " << output_file << "\n";
     }
 
     MPI_Finalize();

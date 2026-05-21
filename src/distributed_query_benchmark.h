@@ -8,6 +8,8 @@
 #include <mpi.h>
 #include <parlay/primitives.h>
 
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -154,92 +156,173 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // Route a single query vector; returns at most num_probes shard IDs.
-    std::vector<int> Route(float* Q) {
-        std::vector<int> probes = router->Query(Q, num_voting_neighbors).RoutingQuery();
-        if ((int)probes.size() > num_probes)
-            probes.resize(num_probes);
-        return probes;
-    }
+    // Per-nprobe result record returned by ProcessSearchSweep.
+    // recall is meaningful only on rank 0; -1.0 means GT was unavailable.
+    struct SearchResult {
+        int    nprobe;
+        double elapsed;   // wall-clock seconds (max across ranks)
+        double recall;    // recall@num_neighbors, or -1.0
+    };
 
     // -----------------------------------------------------------------------
-    // Distributed query processing via MPI_Alltoallv (two-phase fan-out/fan-in).
+    // Sweep nprobe from 1 to num_shards and measure time + recall at each
+    // value.  Mirrors ProcessSearchSweep in distributed_insert_bench_sweep.cpp.
     //
-    // Each rank owns a disjoint slice of query_ids.  The method:
-    //   1. Routes each query to target shards.
-    //   2. Alltoallv fan-out: sends (query_id, query_vector) to target ranks.
-    //   3. Each rank runs searchKnn on its local HNSW for received queries.
-    //   4. Alltoallv fan-in: returns (query_id, neighbor_ids, distances) to owners.
+    // Routing is computed once per query (full shard ordering).
+    // num_voting_neighbors should be >= num_shards so every shard gets a real
+    // distance estimate — call set_voting_neighbors_for_sweep() before this.
     //
-    // Results are collected but not further processed here; the caller measures
-    // wall-clock time end-to-end.
-    std::tuple<std::vector<std::vector<uint32_t>>, std::vector<std::vector<uint32_t>>, std::vector<std::vector<float>>> ProcessQueries(const std::vector<int>& query_ids, PointSet& queries) {
+    // gt_file may be empty or non-existent; recall is then reported as -1.0.
+    std::vector<SearchResult> ProcessSearchSweep(PointSet& queries,
+                                                 const std::string& gt_file) {
         using namespace dqb_detail;
 
-        // ------------------------------------------------------------------
-        // Phase 1 fan-out: build per-shard send buffers.
-        // ------------------------------------------------------------------
-        std::vector<std::vector<uint32_t>> send_qids(comm_size);
-        std::vector<std::vector<float>>    send_qvecs(comm_size);
+        const size_t nq    = queries.n;
+        const size_t chunk = (nq + comm_size - 1) / comm_size;
+        const size_t qs    = (size_t)rank * chunk;
+        const size_t qe    = std::min(nq, qs + chunk);
 
-        for (int qid : query_ids) {
-            float* Q = queries.GetPoint(qid);
-            for (int shard : Route(Q)) {
-                send_qids[shard].push_back((uint32_t)qid);
-                send_qvecs[shard].insert(send_qvecs[shard].end(), Q, Q + dim);
+        // ------------------------------------------------------------------
+        // Pre-compute full shard ordering for every query in this rank's chunk.
+        // ------------------------------------------------------------------
+        std::vector<std::vector<int>> routing_order(qe - qs);
+        for (size_t q = qs; q < qe; ++q)
+            routing_order[q - qs] =
+                router->Query(queries.GetPoint(q), num_voting_neighbors).RoutingQuery();
+
+        // ------------------------------------------------------------------
+        // Load GT and compute per-query kth-distance threshold for recall.
+        // ------------------------------------------------------------------
+        const bool has_gt = !gt_file.empty() &&
+                            std::filesystem::exists(gt_file);
+        std::vector<float> dist_kth(nq, std::numeric_limits<float>::max());
+        if (has_gt) {
+            auto gt = ReadGroundTruth(gt_file);
+            for (size_t q = 0; q < nq; ++q) {
+                auto sorted = gt[q];
+                std::sort(sorted.begin(), sorted.end());
+                if ((int)sorted.size() >= num_neighbors)
+                    dist_kth[q] = sorted[num_neighbors - 1].first;
             }
         }
 
-        std::vector<std::vector<uint32_t>> recv_qids;
-        std::vector<std::vector<float>>    recv_qvecs;
-        AllToAllV(send_qids,  recv_qids,  MPI_UINT32_T, comm_size, MPI_COMM_WORLD);
-        AllToAllV(send_qvecs, recv_qvecs, MPI_FLOAT,    comm_size, MPI_COMM_WORLD);
-
         // ------------------------------------------------------------------
-        // Local HNSW search for all received queries.
+        // Sweep nprobe = 1 .. num_shards.
         // ------------------------------------------------------------------
-        struct QTask { int src; size_t j; uint32_t qid; };
-        std::vector<QTask> qtasks;
-        for (int src = 0; src < comm_size; ++src)
-            for (size_t j = 0; j < recv_qids[src].size(); ++j)
-                qtasks.push_back({src, j, recv_qids[src][j]});
+        std::vector<SearchResult> results;
+        results.reserve(num_shards);
 
-        using KNNResult = std::vector<std::pair<float, hnswlib::labeltype>>;
-        std::vector<KNNResult> qresults(qtasks.size());
+        for (int nprobe = 1; nprobe <= num_shards; ++nprobe) {
 
-        parlay::parallel_for(0, qtasks.size(), [&](size_t ti) {
-            const auto& qt = qtasks[ti];
-            float* Q = recv_qvecs[qt.src].data() + qt.j * dim;
-            auto pq = hnsw->searchKnn(Q, num_neighbors);
-            auto& res = qresults[ti];
-            res.reserve(pq.size());
-            while (!pq.empty()) { res.push_back(pq.top()); pq.pop(); }
-        });
-
-        // ------------------------------------------------------------------
-        // Phase 2 fan-in: pack results and return to query owners.
-        // ------------------------------------------------------------------
-        std::vector<std::vector<uint32_t>> snd_rqids(comm_size);
-        std::vector<std::vector<uint32_t>> snd_rids(comm_size);
-        std::vector<std::vector<float>>    snd_rdists(comm_size);
-
-        for (size_t ti = 0; ti < qtasks.size(); ++ti) {
-            const int src = qtasks[ti].src;
-            snd_rqids[src].push_back(qtasks[ti].qid);
-            for (const auto& [dist, label] : qresults[ti]) {
-                snd_rids[src].push_back((uint32_t)label);
-                snd_rdists[src].push_back(dist);
+            // Build per-shard send buffers using the top-nprobe shards.
+            std::vector<std::vector<uint32_t>> send_qids(comm_size);
+            std::vector<std::vector<float>>    send_qvecs(comm_size);
+            for (size_t q = qs; q < qe; ++q) {
+                float* Q = queries.GetPoint(q);
+                const auto& order = routing_order[q - qs];
+                const int np = std::min(nprobe, (int)order.size());
+                for (int pi = 0; pi < np; ++pi) {
+                    const int s = order[pi];
+                    send_qids[s].push_back((uint32_t)q);
+                    send_qvecs[s].insert(send_qvecs[s].end(), Q, Q + dim);
+                }
             }
+
+            MPI_Barrier(MPI_COMM_WORLD);
+            const double t0 = MPI_Wtime();
+
+            // Phase 1: fan queries out to target shards.
+            std::vector<std::vector<uint32_t>> recv_qids;
+            std::vector<std::vector<float>>    recv_qvecs;
+            AllToAllV(send_qids,  recv_qids,  MPI_UINT32_T, comm_size, MPI_COMM_WORLD);
+            AllToAllV(send_qvecs, recv_qvecs, MPI_FLOAT,    comm_size, MPI_COMM_WORLD);
+
+            // Search received queries against this rank's shard HNSW.
+            struct QTask { int src; size_t j; uint32_t qid; };
+            std::vector<QTask> qtasks;
+            for (int src = 0; src < comm_size; ++src)
+                for (size_t j = 0; j < recv_qids[src].size(); ++j)
+                    qtasks.push_back({src, j, recv_qids[src][j]});
+
+            using KNNResult = std::vector<std::pair<float, hnswlib::labeltype>>;
+            std::vector<KNNResult> qresults(qtasks.size());
+            parlay::parallel_for(0, qtasks.size(), [&](size_t ti) {
+                const auto& qt = qtasks[ti];
+                float* Q = recv_qvecs[qt.src].data() + qt.j * dim;
+                auto pq = hnsw->searchKnn(Q, num_neighbors);
+                auto& res = qresults[ti];
+                res.reserve(num_neighbors);
+                while (!pq.empty()) { res.push_back(pq.top()); pq.pop(); }
+                // Pad to num_neighbors so the fan-in stride is always fixed.
+                while ((int)res.size() < num_neighbors)
+                    res.push_back({std::numeric_limits<float>::max(), 0});
+            });
+
+            // Pack results: one row per (shard_src, query) pair.
+            std::vector<std::vector<uint32_t>> snd_rqids(comm_size);
+            std::vector<std::vector<uint32_t>> snd_rids(comm_size);
+            std::vector<std::vector<float>>    snd_rdists(comm_size);
+            for (size_t ti = 0; ti < qtasks.size(); ++ti) {
+                const int src = qtasks[ti].src;
+                snd_rqids[src].push_back(qtasks[ti].qid);
+                for (int nn = 0; nn < num_neighbors; ++nn) {
+                    snd_rids[src].push_back((uint32_t)qresults[ti][nn].second);
+                    snd_rdists[src].push_back(qresults[ti][nn].first);
+                }
+            }
+
+            // Phase 2: fan results back to query owners.
+            std::vector<std::vector<uint32_t>> rcv_rqids, rcv_rids;
+            std::vector<std::vector<float>>    rcv_rdists;
+            AllToAllV(snd_rqids,  rcv_rqids,  MPI_UINT32_T, comm_size, MPI_COMM_WORLD);
+            AllToAllV(snd_rids,   rcv_rids,   MPI_UINT32_T, comm_size, MPI_COMM_WORLD);
+            AllToAllV(snd_rdists, rcv_rdists, MPI_FLOAT,    comm_size, MPI_COMM_WORLD);
+
+            const double elapsed = MPI_Wtime() - t0;
+            double max_t = 0.0;
+            MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+            // Merge per-shard results into a single top-k list per query.
+            std::vector<NNVec> neighbors(nq);
+            for (int src = 0; src < comm_size; ++src) {
+                const size_t nres = rcv_rqids[src].size();
+                for (size_t j = 0; j < nres; ++j) {
+                    const uint32_t qid = rcv_rqids[src][j];
+                    for (int nn = 0; nn < num_neighbors; ++nn)
+                        neighbors[qid].push_back({
+                            rcv_rdists[src][j * num_neighbors + nn],
+                            rcv_rids[src][j * num_neighbors + nn]});
+                }
+            }
+            // Sort, dedup, and trim to top-k for each query this rank owns.
+            for (size_t q = qs; q < qe; ++q) {
+                auto& nv = neighbors[q];
+                std::sort(nv.begin(), nv.end());
+                nv.erase(std::unique(nv.begin(), nv.end(),
+                    [](const auto& a, const auto& b) {
+                        return a.second == b.second; }),
+                    nv.end());
+                if ((int)nv.size() > num_neighbors) nv.resize(num_neighbors);
+            }
+
+            // Compute recall: each rank counts hits in its own query slice,
+            // then reduce-sum to rank 0.
+            double recall = -1.0;
+            if (has_gt) {
+                uint64_t my_hits = 0;
+                for (size_t q = qs; q < qe; ++q)
+                    for (const auto& [dist, id] : neighbors[q])
+                        if (dist <= dist_kth[q]) ++my_hits;
+                uint64_t total_hits = 0;
+                MPI_Reduce(&my_hits, &total_hits, 1, MPI_UINT64_T,
+                           MPI_SUM, 0, MPI_COMM_WORLD);
+                if (rank == 0)
+                    recall = (double)total_hits / ((double)nq * num_neighbors);
+            }
+
+            results.push_back({nprobe, max_t, recall});
         }
 
-        std::vector<std::vector<uint32_t>> rcv_rqids, rcv_rids;
-        std::vector<std::vector<float>>    rcv_rdists;
-        AllToAllV(snd_rqids,  rcv_rqids,  MPI_UINT32_T, comm_size, MPI_COMM_WORLD);
-        AllToAllV(snd_rids,   rcv_rids,   MPI_UINT32_T, comm_size, MPI_COMM_WORLD);
-        AllToAllV(snd_rdists, rcv_rdists, MPI_FLOAT,    comm_size, MPI_COMM_WORLD);
-
-        // Results available in rcv_r* — communication round-trip complete.
-        // (void)rcv_rqids; (void)rcv_rids; (void)rcv_rdists;
-        return std::make_tuple(rcv_rqids, rcv_rids, rcv_rdists);
+        return results;
     }
 };
