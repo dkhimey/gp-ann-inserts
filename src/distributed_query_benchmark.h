@@ -67,9 +67,10 @@ public:
     int dim           = 0;
     int num_neighbors = 10;
 
-    PointSet          shard_points;
-    std::vector<int>  partition;               // base-point → shard mapping
-    std::vector<int>  routing_index_partition; // centroid → shard mapping (owned, keeps HNSWRouter ref alive)
+    PointSet               shard_points;
+    std::vector<uint32_t>  shard_point_ids;    // local index → global point ID
+    std::vector<int>       partition;               // base-point → shard mapping
+    std::vector<int>       routing_index_partition; // centroid → shard mapping (owned, keeps HNSWRouter ref alive)
 
 #ifdef MIPS_DISTANCE
     using SpaceT = hnswlib::InnerProductSpace;
@@ -140,12 +141,18 @@ public:
         shard_points.coordinates.resize(shard_points.n * shard_points.d);
         dim = (int)d;
 
+        // shard_point_ids maps local HNSW label → global point ID so that
+        // neighbor IDs returned by HNSW searches match the ground-truth file.
+        shard_point_ids.clear();
+        shard_point_ids.reserve(num_points_in_shard);
+
         size_t coords_end = 0;
         for (uint32_t point_id = 0; point_id < n; ++point_id) {
             if (partition[point_id] == rank) {
                 size_t begin = offset + (size_t)point_id * d * sizeof(float);
                 size_t range_length = 0;
                 for ( ; point_id < n && partition[point_id] == rank; ++point_id) {
+                    shard_point_ids.push_back(point_id);
                     ++range_length;
                 }
                 in.seekg((std::streamoff)begin);
@@ -163,7 +170,9 @@ public:
             hnsw_parameters.M, hnsw_parameters.ef_construction,
             /* random seed = */ 555);
         parlay::parallel_for(0, shard_points.n, [&](size_t i) {
-            hnsw->addPoint(shard_points.GetPoint(i), i);
+            // Use the global point ID as the HNSW label so that search results
+            // can be directly compared against the ground-truth file.
+            hnsw->addPoint(shard_points.GetPoint(i), shard_point_ids[i]);
         });
         hnsw->setEf(hnsw_parameters.ef_search);
         shard_points.Drop();
