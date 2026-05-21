@@ -309,17 +309,35 @@ public:
             MPI_Barrier(MPI_COMM_WORLD);
             const double t0 = MPI_Wtime();
 
-            // Routing — inside the timed region.
-            std::vector<std::vector<uint32_t>> send_qids(comm_size);
-            std::vector<std::vector<float>>    send_qvecs(comm_size);
-            for (size_t q = qs; q < qe; ++q) {
+            // Routing — inside the timed region, parallelised over queries.
+            // Each worker fills its own local buffers to avoid contention on
+            // the shared send_qids/send_qvecs, then a sequential merge follows.
+            const size_t num_workers = parlay::num_workers();
+            std::vector<std::vector<std::vector<uint32_t>>> local_qids(
+                num_workers, std::vector<std::vector<uint32_t>>(comm_size));
+            std::vector<std::vector<std::vector<float>>> local_qvecs(
+                num_workers, std::vector<std::vector<float>>(comm_size));
+
+            parlay::parallel_for(qs, qe, [&](size_t q) {
+                const size_t w = parlay::worker_id();
                 float* Q = queries.GetPoint(q);
                 auto order = router->Query(Q, num_voting_neighbors).RoutingQuery();
                 const int np = std::min(nprobe, (int)order.size());
                 for (int pi = 0; pi < np; ++pi) {
                     const int s = order[pi];
-                    send_qids[s].push_back((uint32_t)q);
-                    send_qvecs[s].insert(send_qvecs[s].end(), Q, Q + dim);
+                    local_qids[w][s].push_back((uint32_t)q);
+                    local_qvecs[w][s].insert(local_qvecs[w][s].end(), Q, Q + dim);
+                }
+            });
+
+            std::vector<std::vector<uint32_t>> send_qids(comm_size);
+            std::vector<std::vector<float>>    send_qvecs(comm_size);
+            for (size_t w = 0; w < num_workers; ++w) {
+                for (int s = 0; s < comm_size; ++s) {
+                    send_qids[s].insert(send_qids[s].end(),
+                                        local_qids[w][s].begin(), local_qids[w][s].end());
+                    send_qvecs[s].insert(send_qvecs[s].end(),
+                                         local_qvecs[w][s].begin(), local_qvecs[w][s].end());
                 }
             }
 
