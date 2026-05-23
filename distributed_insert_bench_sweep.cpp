@@ -19,7 +19,8 @@
 //   K must equal the number of shards in the partition file.
 //   GT files: <gt-prefix>/step<i>.gt100
 //   Output CSV columns: step, operation, nprobe, range_start, range_end,
-//                       time_s, qps_or_throughput, recall@K, shard_0_size, ...
+//                       time_s, qps_or_throughput, recall@K,
+//                       shard_0_slots, shard_0_active, ...
 
 #include <mpi.h>
 
@@ -191,18 +192,38 @@ public:
     int num_neighbors        = 10;
     int num_voting_neighbors = 100;
 
-    std::vector<size_t> GatherShardSizes() const {
-        const size_t local_count = local_hnsw ? local_hnsw->cur_element_count.load() : 0;
-        const unsigned long long my_val = static_cast<unsigned long long>(local_count);
-        std::vector<unsigned long long> all_vals(comm_size, 0);
-        MPI_Gather(&my_val, 1, MPI_UNSIGNED_LONG_LONG,
-                   all_vals.data(), 1, MPI_UNSIGNED_LONG_LONG,
-                   0, MPI_COMM_WORLD);
+    // Per-shard size information gathered from all ranks.
+    // slots  = cur_element_count  (total graph nodes, including deleted)
+    // active = slots - num_deleted_  (live, query-visible elements)
+    struct ShardInfo {
+        std::vector<size_t> slots;
+        std::vector<size_t> active;
+    };
+
+    ShardInfo GatherShardInfo() const {
+        const size_t local_slots   = local_hnsw ? local_hnsw->cur_element_count.load() : 0;
+        const size_t local_deleted = local_hnsw ? local_hnsw->num_deleted_ : 0;
+        const size_t local_active  = local_slots - local_deleted;
+
+        const unsigned long long my_slots  = static_cast<unsigned long long>(local_slots);
+        const unsigned long long my_active = static_cast<unsigned long long>(local_active);
+
+        std::vector<unsigned long long> all_slots(comm_size, 0);
+        std::vector<unsigned long long> all_active(comm_size, 0);
+        MPI_Gather(&my_slots,  1, MPI_UNSIGNED_LONG_LONG,
+                   all_slots.data(),  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+        MPI_Gather(&my_active, 1, MPI_UNSIGNED_LONG_LONG,
+                   all_active.data(), 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+
         if (rank != 0) return {};
-        std::vector<size_t> result(comm_size);
-        for (int r = 0; r < comm_size; ++r)
-            result[r] = static_cast<size_t>(all_vals[r]);
-        return result;
+        ShardInfo info;
+        info.slots.resize(comm_size);
+        info.active.resize(comm_size);
+        for (int r = 0; r < comm_size; ++r) {
+            info.slots[r]  = static_cast<size_t>(all_slots[r]);
+            info.active[r] = static_cast<size_t>(all_active[r]);
+        }
+        return info;
     }
 
     std::unique_ptr<KMeansTreeRouter> kmtr;
@@ -600,7 +621,7 @@ int main(int argc, const char* argv[]) {
         csv << "step,operation,nprobe,range_start,range_end,"
             << "time_s,qps_or_throughput,recall@" << num_neighbors;
         for (int r = 0; r < comm_size; ++r)
-            csv << ",shard_" << r << "_size";
+            csv << ",shard_" << r << "_slots,shard_" << r << "_active";
         csv << "\n";
     }
 
@@ -650,13 +671,14 @@ int main(int argc, const char* argv[]) {
                 index_built = true;
 
                 if (rank == 0) {
-                    auto ss = bench.GatherShardSizes();
+                    auto si = bench.GatherShardInfo();
                     csv << op.step_num << ",BUILD,N/A,"
                         << op.start << "," << op.end << ","
                         << build_t << "," << build_tp << ",N/A";
-                    for (auto sz : ss) csv << "," << sz;
+                    for (int r = 0; r < comm_size; ++r)
+                        csv << "," << si.slots[r] << "," << si.active[r];
                     csv << "\n"; csv.flush();
-                } else { bench.GatherShardSizes(); }
+                } else { bench.GatherShardInfo(); }
 
             } else {
                 if (rank == 0)
@@ -672,13 +694,14 @@ int main(int argc, const char* argv[]) {
                               << "  throughput=" << tp << " vec/s\n";
 
                 if (rank == 0) {
-                    auto ss = bench.GatherShardSizes();
+                    auto si = bench.GatherShardInfo();
                     csv << op.step_num << ",INSERT,N/A,"
                         << op.start << "," << op.end << ","
                         << t << "," << tp << ",N/A";
-                    for (auto sz : ss) csv << "," << sz;
+                    for (int r = 0; r < comm_size; ++r)
+                        csv << "," << si.slots[r] << "," << si.active[r];
                     csv << "\n"; csv.flush();
-                } else { bench.GatherShardSizes(); }
+                } else { bench.GatherShardInfo(); }
             }
         }
 
@@ -696,13 +719,14 @@ int main(int argc, const char* argv[]) {
                           << "  throughput=" << tp << " vec/s\n";
 
             if (rank == 0) {
-                auto ss = bench.GatherShardSizes();
+                auto si = bench.GatherShardInfo();
                 csv << op.step_num << ",DELETE,N/A,"
                     << op.start << "," << op.end << ","
                     << t << "," << tp << ",N/A";
-                for (auto sz : ss) csv << "," << sz;
+                for (int r = 0; r < comm_size; ++r)
+                    csv << "," << si.slots[r] << "," << si.active[r];
                 csv << "\n"; csv.flush();
-            } else { bench.GatherShardSizes(); }
+            } else { bench.GatherShardInfo(); }
         }
 
         // ── SEARCH (swept over all nprobe values) ─────────────────────────
@@ -720,9 +744,9 @@ int main(int argc, const char* argv[]) {
             if (rank == 0) std::cout.clear();
 
             // Shard sizes are the same for all nprobe values; gather once.
-            std::vector<size_t> ss;
-            if (rank == 0) ss = bench.GatherShardSizes();
-            else           bench.GatherShardSizes();
+            DistributedInsertBenchmark::ShardInfo si;
+            if (rank == 0) si = bench.GatherShardInfo();
+            else           bench.GatherShardInfo();
 
             if (rank == 0) {
                 for (const auto& r : sweep) {
@@ -740,7 +764,8 @@ int main(int argc, const char* argv[]) {
                         << 0 << "," << queries.n << ","
                         << r.elapsed << "," << qps << ",";
                     if (r.recall >= 0.0) csv << r.recall; else csv << "N/A";
-                    for (auto sz : ss) csv << "," << sz;
+                    for (int r2 = 0; r2 < comm_size; ++r2)
+                        csv << "," << si.slots[r2] << "," << si.active[r2];
                     csv << "\n";
                 }
                 csv.flush();
