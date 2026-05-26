@@ -20,7 +20,14 @@
 //   GT files: <gt-prefix>/step<i>.gt100
 //   Output CSV columns: step, operation, nprobe, range_start, range_end,
 //                       time_s, qps_or_throughput, recall@K,
+//                       theoretical_recall,
 //                       shard_0_slots, shard_0_active, ...
+//
+//   theoretical_recall is computed per nprobe by comparing each query's
+//   routing order against the shards that actually hold its top-K GT
+//   neighbours (looked up via label_to_shard, kept in sync across ranks).
+//   See `compute_gpann_recall_static.py` for the static-dataset analogue
+//   (this benchmark computes the same quantity inline, dynamically).
 
 #include <mpi.h>
 
@@ -35,6 +42,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <parlay/primitives.h>
@@ -419,9 +427,21 @@ public:
     // Then for each nprobe value we run a separate Alltoallv fan-out so that
     // timing reflects the actual cost at that nprobe.
     //
-    // Returns a vector of (nprobe, elapsed_s, recall) for each nprobe value.
-    // recall is meaningful only on rank 0; set to -1.0 if GT file is missing.
-    struct SearchResult { int nprobe; double elapsed; double recall; };
+    // Returns a vector of (nprobe, elapsed_s, recall, theoretical_recall) for
+    // each nprobe value.  recall and theoretical_recall are meaningful only
+    // on rank 0; both are set to -1.0 if the GT file is missing.
+    //
+    // theoretical_recall = mean over queries of
+    //   | gt_shards(q) ∩ routing_order(q)[:nprobe] | / | gt_shards(q) |
+    // where gt_shards(q) is the set of shards holding q's top-K GT neighbors
+    // (looked up directly via label_to_shard, no routing HNSW needed because
+    // gp-ann partitions base vectors directly).
+    struct SearchResult {
+        int    nprobe;
+        double elapsed;
+        double recall;
+        double theoretical_recall;
+    };
 
     std::vector<SearchResult> ProcessSearchSweep(PointSet& queries,
                                                  const std::string& gt_file) {
@@ -439,9 +459,14 @@ public:
                 router->Query(Q, num_voting_neighbors).RoutingQuery();
         }
 
-        // Load GT and compute kth-distance thresholds (needed for recall).
+        // Load GT and compute (a) kth-distance thresholds (needed for actual
+        // recall) and (b) per-query GT shard sets (needed for theoretical
+        // recall).  GT shard sets are only built for this rank's query slice
+        // since each rank only contributes its slice to the per-nprobe reduce.
         bool has_gt = !gt_file.empty() && std::filesystem::exists(gt_file);
         std::vector<float> dist_kth(nq, std::numeric_limits<float>::max());
+        // gt_shards is indexed [q - qs] over this rank's slice.
+        std::vector<std::unordered_set<int>> gt_shards(qe - qs);
         if (has_gt) {
             auto gt = ReadGroundTruth(gt_file);
             for (size_t q = 0; q < nq; ++q) {
@@ -449,6 +474,23 @@ public:
                 std::sort(sorted.begin(), sorted.end());
                 if ((int)sorted.size() >= num_neighbors)
                     dist_kth[q] = sorted[num_neighbors - 1].first;
+            }
+            // Build per-query GT shard sets for queries this rank owns.
+            // label_to_shard is consistent across ranks (synced by inserts /
+            // mutated identically on deletes), so any rank can do this lookup.
+            // GT ids that are missing from label_to_shard (e.g. because they
+            // were deleted) are silently skipped — matching the static gp-ann
+            // recall script, which excludes unmapped neighbours from the
+            // numerator and denominator.
+            for (size_t q = qs; q < qe; ++q) {
+                auto& gt_q = gt[q];
+                const int kk = std::min((int)gt_q.size(), num_neighbors);
+                for (int i = 0; i < kk; ++i) {
+                    const uint32_t id = gt_q[i].second;
+                    auto it = label_to_shard.find(id);
+                    if (it != label_to_shard.end())
+                        gt_shards[q - qs].insert(it->second);
+                }
             }
         }
 
@@ -545,21 +587,52 @@ public:
                 if ((int)nv.size() > num_neighbors) nv.resize(num_neighbors);
             }
 
-            // Compute recall.
+            // Compute actual recall (from returned neighbors vs kth GT distance)
+            // and theoretical recall (which shards the router *would* probe
+            // vs which shards the GT vectors actually live in).
+            //
+            // Theoretical recall per query =
+            //   | gt_shards(q) ∩ routing_order(q)[:nprobe] | / | gt_shards(q) |
+            // Queries whose gt_shards is empty (e.g. all GT ids unmapped) are
+            // excluded from the average, mirroring the static-recall script.
             double recall = -1.0;
+            double theoretical_recall = -1.0;
             if (has_gt) {
                 uint64_t my_hits = 0;
-                for (size_t q = qs; q < qe; ++q)
+                double   my_theo_sum    = 0.0;
+                uint64_t my_theo_counted = 0;
+                for (size_t q = qs; q < qe; ++q) {
                     for (const auto& [dist, id] : neighbors[q])
                         if (dist <= dist_kth[q]) ++my_hits;
-                uint64_t total_hits = 0;
-                MPI_Reduce(&my_hits, &total_hits, 1, MPI_UINT64_T,
+
+                    const auto& gts = gt_shards[q - qs];
+                    if (gts.empty()) continue;
+                    const auto& order = routing_order[q - qs];
+                    const int np = std::min(nprobe, (int)order.size());
+                    int inter = 0;
+                    for (int pi = 0; pi < np; ++pi)
+                        if (gts.count(order[pi])) ++inter;
+                    my_theo_sum    += (double)inter / (double)gts.size();
+                    my_theo_counted += 1;
+                }
+
+                // One combined reduce: total_hits, total theoretical sum,
+                // total counted-queries.  Packed into a double[3] (the hit
+                // count fits exactly in a double up to 2^53, well above any
+                // realistic nq * num_neighbors).
+                double local_acc[3]  = { (double)my_hits, my_theo_sum,
+                                         (double)my_theo_counted };
+                double global_acc[3] = { 0.0, 0.0, 0.0 };
+                MPI_Reduce(local_acc, global_acc, 3, MPI_DOUBLE,
                            MPI_SUM, 0, MPI_COMM_WORLD);
-                if (rank == 0)
-                    recall = (double)total_hits / ((double)nq * num_neighbors);
+                if (rank == 0) {
+                    recall = global_acc[0] / ((double)nq * num_neighbors);
+                    theoretical_recall = global_acc[2] > 0
+                        ? global_acc[1] / global_acc[2] : -1.0;
+                }
             }
 
-            results.push_back({nprobe, max_t, recall});
+            results.push_back({nprobe, max_t, recall, theoretical_recall});
         }
 
         return results;
@@ -619,7 +692,8 @@ int main(int argc, const char* argv[]) {
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
         csv << "step,operation,nprobe,range_start,range_end,"
-            << "time_s,qps_or_throughput,recall@" << num_neighbors;
+            << "time_s,qps_or_throughput,recall@" << num_neighbors
+            << ",theoretical_recall";
         for (int r = 0; r < comm_size; ++r)
             csv << ",shard_" << r << "_slots,shard_" << r << "_active";
         csv << "\n";
@@ -674,7 +748,7 @@ int main(int argc, const char* argv[]) {
                     auto si = bench.GatherShardInfo();
                     csv << op.step_num << ",BUILD,N/A,"
                         << op.start << "," << op.end << ","
-                        << build_t << "," << build_tp << ",N/A";
+                        << build_t << "," << build_tp << ",N/A,N/A";
                     for (int r = 0; r < comm_size; ++r)
                         csv << "," << si.slots[r] << "," << si.active[r];
                     csv << "\n"; csv.flush();
@@ -697,7 +771,7 @@ int main(int argc, const char* argv[]) {
                     auto si = bench.GatherShardInfo();
                     csv << op.step_num << ",INSERT,N/A,"
                         << op.start << "," << op.end << ","
-                        << t << "," << tp << ",N/A";
+                        << t << "," << tp << ",N/A,N/A";
                     for (int r = 0; r < comm_size; ++r)
                         csv << "," << si.slots[r] << "," << si.active[r];
                     csv << "\n"; csv.flush();
@@ -722,7 +796,7 @@ int main(int argc, const char* argv[]) {
                 auto si = bench.GatherShardInfo();
                 csv << op.step_num << ",DELETE,N/A,"
                     << op.start << "," << op.end << ","
-                    << t << "," << tp << ",N/A";
+                    << t << "," << tp << ",N/A,N/A";
                 for (int r = 0; r < comm_size; ++r)
                     csv << "," << si.slots[r] << "," << si.active[r];
                 csv << "\n"; csv.flush();
@@ -758,12 +832,18 @@ int main(int argc, const char* argv[]) {
                     if (r.recall >= 0.0)
                         std::cout << "  recall@" << num_neighbors
                                   << "=" << r.recall;
+                    if (r.theoretical_recall >= 0.0)
+                        std::cout << "  theo_recall="
+                                  << r.theoretical_recall;
                     std::cout << "\n";
 
                     csv << op.step_num << ",SEARCH," << r.nprobe << ","
                         << 0 << "," << queries.n << ","
                         << r.elapsed << "," << qps << ",";
                     if (r.recall >= 0.0) csv << r.recall; else csv << "N/A";
+                    csv << ",";
+                    if (r.theoretical_recall >= 0.0) csv << r.theoretical_recall;
+                    else                              csv << "N/A";
                     for (int r2 = 0; r2 < comm_size; ++r2)
                         csv << "," << si.slots[r2] << "," << si.active[r2];
                     csv << "\n";
