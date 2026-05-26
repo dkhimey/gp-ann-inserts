@@ -209,8 +209,8 @@ public:
     };
 
     ShardInfo GatherShardInfo() const {
-        const size_t local_slots   = local_hnsw ? local_hnsw->cur_element_count.load() : 0;
-        const size_t local_deleted = local_hnsw ? local_hnsw->num_deleted_ : 0;
+        const size_t local_slots   = local_hnsw ? local_hnsw->cur_element_count.load() : size_t(0);
+        const size_t local_deleted = local_hnsw ? local_hnsw->num_deleted_.load()     : size_t(0);
         const size_t local_active  = local_slots - local_deleted;
 
         const unsigned long long my_slots  = static_cast<unsigned long long>(local_slots);
