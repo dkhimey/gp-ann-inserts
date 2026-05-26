@@ -460,13 +460,20 @@ public:
         }
 
         // Load GT and compute (a) kth-distance thresholds (needed for actual
-        // recall) and (b) per-query GT shard sets (needed for theoretical
-        // recall).  GT shard sets are only built for this rank's query slice
-        // since each rank only contributes its slice to the per-nprobe reduce.
+        // recall) and (b) per-query per-neighbour GT shard arrays (needed for
+        // theoretical recall).  Only built for this rank's query slice since
+        // each rank only contributes its slice to the per-nprobe reduce.
         bool has_gt = !gt_file.empty() && std::filesystem::exists(gt_file);
         std::vector<float> dist_kth(nq, std::numeric_limits<float>::max());
-        // gt_shards is indexed [q - qs] over this rank's slice.
-        std::vector<std::unordered_set<int>> gt_shards(qe - qs);
+        // gt_shards_per_q[q-qs][i] = shard holding the i-th GT neighbour of
+        // query q, or -1 if the id is unmapped (e.g. tombstoned).  Stores
+        // duplicates: we want *neighbor-frequency* theoretical recall, which
+        // is a true upper bound on actual recall — if a GT neighbour's shard
+        // isn't visited, the search cannot return that neighbour.  Matches
+        // compute_theoretical_recall_updated.py's _recall() exactly.
+        // (compute_gpann_recall_static.py uses a unique-partition variant
+        // which does NOT upper-bound actual recall and is not used here.)
+        std::vector<std::vector<int>> gt_shards_per_q(qe - qs);
         if (has_gt) {
             auto gt = ReadGroundTruth(gt_file);
             for (size_t q = 0; q < nq; ++q) {
@@ -475,21 +482,16 @@ public:
                 if ((int)sorted.size() >= num_neighbors)
                     dist_kth[q] = sorted[num_neighbors - 1].first;
             }
-            // Build per-query GT shard sets for queries this rank owns.
-            // label_to_shard is consistent across ranks (synced by inserts /
-            // mutated identically on deletes), so any rank can do this lookup.
-            // GT ids that are missing from label_to_shard (e.g. because they
-            // were deleted) are silently skipped — matching the static gp-ann
-            // recall script, which excludes unmapped neighbours from the
-            // numerator and denominator.
             for (size_t q = qs; q < qe; ++q) {
                 auto& gt_q = gt[q];
                 const int kk = std::min((int)gt_q.size(), num_neighbors);
+                auto& shards = gt_shards_per_q[q - qs];
+                shards.assign(kk, -1);
                 for (int i = 0; i < kk; ++i) {
                     const uint32_t id = gt_q[i].second;
                     auto it = label_to_shard.find(id);
                     if (it != label_to_shard.end())
-                        gt_shards[q - qs].insert(it->second);
+                        shards[i] = it->second;
                 }
             }
         }
@@ -588,13 +590,12 @@ public:
             }
 
             // Compute actual recall (from returned neighbors vs kth GT distance)
-            // and theoretical recall (which shards the router *would* probe
-            // vs which shards the GT vectors actually live in).
-            //
-            // Theoretical recall per query =
-            //   | gt_shards(q) ∩ routing_order(q)[:nprobe] | / | gt_shards(q) |
-            // Queries whose gt_shards is empty (e.g. all GT ids unmapped) are
-            // excluded from the average, mirroring the static-recall script.
+            // and theoretical recall (neighbor-frequency: fraction of a query's
+            // top-K GT neighbours whose owning shard would be probed by the
+            // router at this nprobe).  This is a strict upper bound on actual
+            // recall — if a GT neighbour's shard isn't visited, that neighbour
+            // cannot be returned by the merge.  Denominator is num_neighbors
+            // (mirrors actual recall@K), so unmapped GT ids count as 0 hits.
             double recall = -1.0;
             double theoretical_recall = -1.0;
             if (has_gt) {
@@ -605,14 +606,20 @@ public:
                     for (const auto& [dist, id] : neighbors[q])
                         if (dist <= dist_kth[q]) ++my_hits;
 
-                    const auto& gts = gt_shards[q - qs];
-                    if (gts.empty()) continue;
+                    const auto& shards = gt_shards_per_q[q - qs];
+                    if (shards.empty()) continue;
                     const auto& order = routing_order[q - qs];
                     const int np = std::min(nprobe, (int)order.size());
                     int inter = 0;
-                    for (int pi = 0; pi < np; ++pi)
-                        if (gts.count(order[pi])) ++inter;
-                    my_theo_sum    += (double)inter / (double)gts.size();
+                    for (int s : shards) {
+                        if (s < 0) continue;
+                        // visited shards are order[0..np); np is small
+                        // (≤ num_shards), so a linear scan beats a per-query
+                        // set allocation.
+                        for (int pi = 0; pi < np; ++pi)
+                            if (order[pi] == s) { ++inter; break; }
+                    }
+                    my_theo_sum    += (double)inter / (double)num_neighbors;
                     my_theo_counted += 1;
                 }
 
