@@ -135,8 +135,14 @@ static Runbook ParseRunbook(const std::string& path) {
 
 static PointSet ReadPointsRange(const std::string& path,
                                 uint32_t start, uint32_t end) {
-    if (!path.ends_with(".fbin"))
-        throw std::runtime_error("ReadPointsRange only supports .fbin");
+    const bool is_fbin  = path.ends_with(".fbin");
+    const bool is_u8bin = path.ends_with(".u8bin");
+    const bool is_i8bin = path.ends_with(".i8bin");
+    if (!is_fbin && !is_u8bin && !is_i8bin)
+        throw std::runtime_error(
+            "ReadPointsRange: unsupported format '" + path +
+            "'. Supported: .fbin, .u8bin, .i8bin");
+
     uint32_t n_file = 0, d = 0;
     {
         std::ifstream in(path, std::ios::binary);
@@ -150,11 +156,31 @@ static PointSet ReadPointsRange(const std::string& path,
     ps.coordinates.resize(count * d, 0.f);
     if (count > 0) {
         std::ifstream in(path, std::ios::binary);
-        in.seekg(static_cast<std::streamoff>(
-            2 * sizeof(uint32_t) +
-            static_cast<size_t>(start) * d * sizeof(float)));
-        in.read(reinterpret_cast<char*>(ps.coordinates.data()),
-                static_cast<std::streamsize>(count * d * sizeof(float)));
+        if (is_fbin) {
+            in.seekg(static_cast<std::streamoff>(
+                2 * sizeof(uint32_t) +
+                static_cast<size_t>(start) * d * sizeof(float)));
+            in.read(reinterpret_cast<char*>(ps.coordinates.data()),
+                    static_cast<std::streamsize>(count * d * sizeof(float)));
+        } else if (is_u8bin) {
+            in.seekg(static_cast<std::streamoff>(
+                2 * sizeof(uint32_t) +
+                static_cast<size_t>(start) * d * sizeof(uint8_t)));
+            std::vector<uint8_t> buf(count * d);
+            in.read(reinterpret_cast<char*>(buf.data()),
+                    static_cast<std::streamsize>(count * d * sizeof(uint8_t)));
+            for (size_t i = 0; i < count * d; ++i)
+                ps.coordinates[i] = static_cast<float>(buf[i]);
+        } else { // is_i8bin
+            in.seekg(static_cast<std::streamoff>(
+                2 * sizeof(uint32_t) +
+                static_cast<size_t>(start) * d * sizeof(int8_t)));
+            std::vector<int8_t> buf(count * d);
+            in.read(reinterpret_cast<char*>(buf.data()),
+                    static_cast<std::streamsize>(count * d * sizeof(int8_t)));
+            for (size_t i = 0; i < count * d; ++i)
+                ps.coordinates[i] = static_cast<float>(buf[i]);
+        }
     }
     return ps;
 }
