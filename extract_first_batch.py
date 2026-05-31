@@ -51,14 +51,19 @@ def parse_first_insert(runbook_path):
     raise ValueError("No insert operation with start/end found in runbook.")
 
 
+
 def extract_batch(base_path, out_path, start, end):
     count = end - start
+    is_u8 = base_path.endswith(".u8bin")
+    elem_size = 1 if is_u8 else 4
+    dtype = np.uint8 if is_u8 else np.float32
+
     with open(base_path, "rb") as f:
         n, d = struct.unpack("II", f.read(8))
         if end > n:
             raise ValueError(f"end={end} exceeds file size n={n}")
-        f.seek(8 + start * d * 4)
-        vecs = np.frombuffer(f.read(count * d * 4), dtype=np.float32).copy()
+        f.seek(8 + start * d * elem_size)
+        vecs = np.frombuffer(f.read(count * d * elem_size), dtype=dtype).copy()
 
     with open(out_path, "wb") as f:
         f.write(struct.pack("II", count, d))
@@ -66,7 +71,6 @@ def extract_batch(base_path, out_path, start, end):
 
     print(f"Extracted vectors [{start}, {end})  count={count}  dim={d}")
     print(f"Written to: {out_path}")
-
 
 if __name__ == "__main__":
     if len(sys.argv) != 4:
