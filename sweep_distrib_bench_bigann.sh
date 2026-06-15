@@ -13,6 +13,16 @@ mpirun -mca btl_tcp_if_include br-flat-lan-1 -np 10 --rankfile rankfile.txt \
     10 bigann100Mclustered_runbook_results_nprobe_with_theo_sweep.csv
 
 
+    # --- shift ---
+mpirun -mca btl_tcp_if_include br-flat-lan-1 -np 10 --rankfile rankfile.txt \
+    taskset -c 0-31 ./release_l2/DistributedInsertBenchSweep \
+    ${BASE}/bigann-shift/100M-bigann-shift.u8bin \
+    ${BASE}/bigann-shift/query.public.10K.u8bin \
+    ${BASE}/bigann-shift/gpann_partitions/bigann100Mshift.k\=10.GP \
+    ${BASE}/bigann-shift/100000000/bigann-100M-shift_runbookfinal.yaml/ \
+    ${BASE}/bigann-shift/bigann-100M-shift_runbookfinal.yaml \
+    10 bigann100Mshift_runbook_results_nprobe_with_theo_sweep.csv
+
     # --- random ---
 mpirun -mca btl_tcp_if_include br-flat-lan-1 -np 10 --rankfile rankfile.txt \
     taskset -c 0-31 ./release_l2/DistributedInsertBenchSweep \
