@@ -336,7 +336,7 @@ public:
 
         local_hnsw = std::make_unique<hnswlib::HierarchicalNSW<float>>(
             space.get(), capacity, 16, 200, 555 + rank);
-        local_hnsw->setEf(120);
+        local_hnsw->setEf(200);
 
         const auto& my_cluster = clusters[rank];
         parlay::parallel_for(0, my_cluster.size(), [&](size_t i) {
