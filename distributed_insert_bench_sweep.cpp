@@ -316,7 +316,11 @@ public:
           routing_points = std::move(rp); routing_partition = std::move(rpart); }
         router = std::make_unique<HNSWRouter>(
             routing_points, num_shards, routing_partition,
-            HNSWParameters{ .M=16, .ef_construction=200, .ef_search=200 });
+            // Routing HNSW search ef = 100, consistent with the SURGE runbook
+            // sweep's routing ef (EF_ROUTING in shared_batch_experiment_sweep.cpp).
+            // The per-shard local_hnsw search ef (set to 200 below) is the
+            // search-quality knob and is intentionally left unchanged.
+            HNSWParameters{ .M=16, .ef_construction=200, .ef_search=100 });
         router->Train(routing_points);
 
         space = std::make_unique<
