@@ -21,7 +21,11 @@
 //
 // CSV columns
 // -----------
-//   nprobe, time_s, qps, recall@<K>
+//   nprobe, time_s, qps, recall@<K>, theoretical_recall@<K>
+//
+// theoretical_recall@<K> is the point-level routing recall: the fraction of
+// true k-NN whose owning shard is among the top-nprobe probed shards, i.e. the
+// recall an oracle in-shard search would achieve. It upper-bounds recall@<K>.
 
 #include <filesystem>
 #include <fstream>
@@ -116,7 +120,8 @@ int main(int argc, const char* argv[]) {
             std::cerr << "Cannot open output file: " << output_file << "\n";
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
-        csv << "nprobe,time_s,qps,recall@" << num_neighbors << "\n";
+        csv << "nprobe,time_s,qps,recall@" << num_neighbors
+            << ",theoretical_recall@" << num_neighbors << "\n";
     }
 
     // ------------------------------------------------------------------
@@ -139,11 +144,13 @@ int main(int argc, const char* argv[]) {
                       << "  time=" << r.min_elapsed << " s"
                       << "  QPS=" << qps;
             if (has_gt)
-                std::cout << "  recall@" << num_neighbors << "=" << r.recall;
+                std::cout << "  recall@" << num_neighbors << "=" << r.recall
+                          << "  theoretical_recall@" << num_neighbors << "=" << r.theoretical_recall;
             std::cout << "\n";
 
             csv << r.nprobe << "," << r.min_elapsed << "," << qps << ",";
-            if (has_gt) csv << r.recall; else csv << "N/A";
+            if (has_gt) csv << r.recall << "," << r.theoretical_recall;
+            else        csv << "N/A,N/A";
             csv << "\n";
         }
         csv.flush();

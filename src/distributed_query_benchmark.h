@@ -241,8 +241,9 @@ public:
     // recall is meaningful only on rank 0; -1.0 means GT was unavailable.
     struct SearchResult {
         int    nprobe;
-        double min_elapsed;  // min across bench rounds (max across ranks each round)
-        double recall;       // recall@num_neighbors, or -1.0
+        double min_elapsed;       // min across bench rounds (max across ranks each round)
+        double recall;            // empirical recall@num_neighbors, or -1.0
+        double theoretical_recall; // point-level routing (oracle in-shard) recall, or -1.0
     };
 
     // -----------------------------------------------------------------------
@@ -293,6 +294,78 @@ public:
                 for (int j = 0; j < k; ++j)
                     ids.push_back(gt[q][j].second);
                 std::sort(ids.begin(), ids.end());
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Point-level theoretical (routing) recall.
+        //
+        // This is the recall achievable if in-shard search were perfect: for
+        // each query we take the router's ranked shard order and, at nprobe=n,
+        // count how many of the query's true k neighbors live in one of the
+        // top-n probed shards. It is an upper bound on the empirical recall
+        // computed below, which additionally pays for approximate in-shard
+        // HNSW search; the gap (theoretical - empirical) is the in-shard loss.
+        //
+        // Computed once, independently of the timed pipeline, and shares the
+        // exact same routing order (router->Query(...).RoutingQuery()) used by
+        // run_one_pass so the comparison is apples-to-apples. Each rank handles
+        // its own query slice [qs,qe); a neighbor counts as found at nprobe n
+        // iff its owning shard partition[neighbor_id] appears within the first
+        // n entries of the probe order. We bucket each (query,neighbor) pair by
+        // the probe position at which its shard first appears, reduce across
+        // ranks, then prefix-sum to get cumulative hits at every nprobe.
+        //
+        // Denominator is nq * num_neighbors, identical to the empirical recall
+        // above, so the two curves are directly comparable.
+        // ------------------------------------------------------------------
+        std::vector<double> theoretical_recall(num_shards + 1, -1.0);
+        if (has_gt) {
+            const size_t num_workers = parlay::num_workers();
+            // add_at[w][p] = # of (query,neighbor) pairs whose owning shard
+            // first appears at probe position p (0-indexed) in the order.
+            std::vector<std::vector<uint64_t>> add_at(
+                num_workers, std::vector<uint64_t>(num_shards, 0));
+
+            parlay::parallel_for(qs, qe, [&](size_t q) {
+                const size_t w = parlay::worker_id();
+                float* Q = queries.GetPoint(q);
+                auto order = router->Query(Q, num_voting_neighbors).RoutingQuery();
+
+                // pos[s] = first probe position of shard s, or num_shards if absent.
+                std::vector<int> pos(num_shards, num_shards);
+                const int lim = std::min<int>((int)order.size(), num_shards);
+                for (int p = 0; p < lim; ++p) {
+                    const int s = order[p];
+                    if (s >= 0 && s < num_shards && pos[s] == num_shards) pos[s] = p;
+                }
+
+                for (uint32_t gid : gt_ids[q]) {
+                    if (gid >= partition.size()) continue;
+                    const int s = partition[gid];
+                    if (s < 0 || s >= num_shards) continue;   // unpartitioned neighbor
+                    const int p = pos[s];
+                    if (p < num_shards) add_at[w][p] += 1;    // found once shard s is probed
+                }
+            });
+
+            // Merge per-worker buckets, then sum across ranks (disjoint slices).
+            std::vector<uint64_t> local_add(num_shards, 0);
+            for (size_t w = 0; w < num_workers; ++w)
+                for (int p = 0; p < num_shards; ++p)
+                    local_add[p] += add_at[w][p];
+
+            std::vector<uint64_t> global_add(num_shards, 0);
+            MPI_Reduce(local_add.data(), global_add.data(), num_shards,
+                       MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
+
+            if (rank == 0) {
+                const double denom = (double)nq * num_neighbors;
+                uint64_t cum = 0;
+                for (int nprobe = 1; nprobe <= num_shards; ++nprobe) {
+                    cum += global_add[nprobe - 1];   // neighbors found once nprobe shards probed
+                    theoretical_recall[nprobe] = denom > 0 ? (double)cum / denom : 0.0;
+                }
             }
         }
 
@@ -464,7 +537,7 @@ public:
                 min_t = std::min(min_t, max_t);
             }
 
-            results.push_back({nprobe, min_t, recall});
+            results.push_back({nprobe, min_t, recall, theoretical_recall[nprobe]});
         }
 
         return results;
