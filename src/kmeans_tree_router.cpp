@@ -1,5 +1,7 @@
 #include "kmeans_tree_router.h"
 
+#include <chrono>
+#include <cmath>
 #include <iostream>
 #include <numeric>
 #include <parlay/parallel.h>
@@ -13,21 +15,54 @@ void KMeansTreeRouter::Train(PointSet& points, const Clusters& clusters, KMeansT
 
     std::cout << "Train. num-shards = " << num_shards << " dim = " << dim << " budget = " << options.budget << std::endl;
 
-    int num_shards_processed_in_parallel = 8;
+    // Each extracted shard PointSet costs roughly (shard_size * d * 4) bytes
+    // as float32 after conversion from u8bin/i8bin.  For a 500M / 10-shard
+    // u8bin dataset that is ~25 GB per shard.  Keep this at 1–2 on machines
+    // with ≤128 GB RAM; raise it only when you have headroom to spare.
+    int num_shards_processed_in_parallel = 2;
 #ifdef MIPS_DISTANCE
-    // not for MIPS_DISTANCE (just for text-to-image...)
-    num_shards_processed_in_parallel = 4;
+    num_shards_processed_in_parallel = 1;
 #endif
+
+    const auto wall_start = std::chrono::steady_clock::now();
 
     parlay::parallel_for(
             0, num_shards,
             [&](int b) {
-                // for (int b = 0; b < num_shards; ++b) {      // go sequential for the big datasets on not the biggest memory machines
+                auto t0 = std::chrono::steady_clock::now();
+                const size_t shard_n = clusters[b].size();
+                std::cerr << "[shard " << b << "/" << num_shards
+                          << "] extracting " << shard_n << " points...\n" << std::flush;
+
                 PointSet ps = ExtractPointsInBucket(clusters[b], points);
+
+                auto t1 = std::chrono::steady_clock::now();
+                double extract_s = std::chrono::duration<double>(t1 - t0).count();
+                int shard_budget = (int)(double(shard_n) * options.budget / double(points.n));
+                std::cerr << "[shard " << b << "/" << num_shards
+                          << "] extracted in " << (int)extract_s << "s"
+                          << "  training (budget=" << shard_budget << ")...\n" << std::flush;
+
                 KMeansTreeRouterOptions recursive_options = options;
-                recursive_options.budget = double(clusters[b].size() * options.budget) / double(points.n);
+                recursive_options.budget = shard_budget;
                 TrainRecursive(ps, recursive_options, roots[b], 555 * b);
-                // }
+
+                auto t2 = std::chrono::steady_clock::now();
+                double shard_s  = std::chrono::duration<double>(t2 - t0).count();
+                double wall_s   = std::chrono::duration<double>(t2 - wall_start).count();
+                // Rough ETA: assume remaining shards take the same time as this one.
+                // With num_shards_processed_in_parallel shards running concurrently,
+                // the number of remaining "slots" is ceil(remaining / parallelism).
+                int done        = b + 1;  // approximate — parallel, so slightly off
+                int remaining   = num_shards - done;
+                double eta_s    = (remaining > 0)
+                                  ? shard_s * std::ceil((double)remaining / num_shards_processed_in_parallel)
+                                  : 0.0;
+                std::cerr << "[shard " << b << "/" << num_shards
+                          << "] done in " << (int)shard_s << "s"
+                          << "  elapsed=" << (int)wall_s << "s"
+                          << "  ETA~" << (int)(eta_s / 60) << "m" << (int)eta_s % 60 << "s\n"
+                          << std::flush;
             },
             num_shards / num_shards_processed_in_parallel);
 }
