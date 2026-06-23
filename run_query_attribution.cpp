@@ -40,7 +40,20 @@ int main(int argc, const char* argv[]) {
     std::string requested_num_shards_str = argv[8];
     int requested_num_shards = std::stoi(requested_num_shards_str);
 
-    PointSet points = ReadPoints(point_file);
+    // Memory-map the base points instead of reading them into RAM.
+    // ReadPoints() stores every coordinate as float, so 500M x 128 would need
+    // 500e6 * 128 * 4 = 256 GB and aborts with std::bad_alloc on open. The mmap
+    // loaders keep the data at its on-disk size (uint8 -> 64 GB, paged in on
+    // demand) and convert to float on the fly in PointSet::GetPoint().
+    PointSet points;
+    if (point_file.ends_with(".fbin")) {
+        points = ReadPointsMmap(point_file);
+    } else if (point_file.ends_with(".u8bin")) {
+        points = ReadU8BinMmap(point_file);
+    } else {
+        points = ReadPoints(point_file);
+    }
+    // Queries are tiny (10K), so loading them into RAM is fine.
     PointSet queries = ReadPoints(query_file);
 
     std::vector<NNVec> ground_truth;
