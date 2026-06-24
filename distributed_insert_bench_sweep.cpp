@@ -225,6 +225,12 @@ public:
     int rank = 0, comm_size = 1, num_shards = 1, dim = 0;
     int num_neighbors        = 10;
     int num_voting_neighbors = 100;
+    // Search-query scaling factor (1.0 = no scaling).  During a search step the
+    // query batch is tiled (logical query q reuses original query q % nq_orig) so
+    // the timed fan-out/search/return processes nq = round(nq_orig * search_scale)
+    // queries — QPS is reported over that scaled count — while recall and
+    // theoretical recall are computed once over the original query set + GT.
+    double search_scale = 1.0;
 
     // Per-shard size information gathered from all ranks.
     // slots  = cur_element_count  (total graph nodes, including deleted)
@@ -471,20 +477,34 @@ public:
         double elapsed;
         double recall;
         double theoretical_recall;
+        // Number of (scaled) queries processed in the timed window for this
+        // nprobe; QPS = scaled_nq / elapsed.  Equals nq_orig when search_scale=1.
+        size_t scaled_nq;
     };
 
     std::vector<SearchResult> ProcessSearchSweep(PointSet& queries,
                                                  const std::string& gt_file) {
-        const size_t nq    = queries.n;
+        // nq_orig = distinct queries in the file (and the GT row count).
+        // nq      = scaled query count processed by the TIMED fan-out/search/
+        //           return; the batch is tiled (query q reuses original q%nq_orig).
+        // chunk/qs/qe partition the SCALED index space so the timed work is spread
+        // across ranks.  Recall and theoretical recall are computed once over the
+        // first tile (q < nq_orig) — i.e. exactly the original query set + GT.
+        const size_t nq_orig = queries.n;
+        const size_t nq      = (nq_orig == 0) ? 0
+            : std::max<size_t>(1,
+                  (size_t)((double)nq_orig * search_scale + 0.5));
         const size_t chunk = (nq + comm_size - 1) / comm_size;
         const size_t qs    = (size_t)rank * chunk;
         const size_t qe    = std::min(nq, qs + chunk);
 
-        // Compute routing order for each query in this rank's chunk.
-        // routing_order[q - qs][s] = the s-th shard to probe for query q.
+        // Compute routing order for each query in this rank's (scaled) chunk.
+        // routing_order[q - qs][s] = the s-th shard to probe for query q.  Tiled:
+        // a copy reuses the original query's vector, hence its routing order.
+        // Computed outside the timed window.
         std::vector<std::vector<int>> routing_order(qe - qs);
         for (size_t q = qs; q < qe; ++q) {
-            float* Q = queries.GetPoint(q);
+            float* Q = queries.GetPoint(q % nq_orig);
             routing_order[q - qs] =
                 router->Query(Q, num_voting_neighbors).RoutingQuery();
         }
@@ -494,7 +514,9 @@ public:
         // theoretical recall).  Only built for this rank's query slice since
         // each rank only contributes its slice to the per-nprobe reduce.
         bool has_gt = !gt_file.empty() && std::filesystem::exists(gt_file);
-        std::vector<float> dist_kth(nq, std::numeric_limits<float>::max());
+        // dist_kth / gt_shards are indexed over the ORIGINAL query set (GT has
+        // nq_orig rows); tile copies reuse these via the first-tile gate below.
+        std::vector<float> dist_kth(nq_orig, std::numeric_limits<float>::max());
         // gt_shards_per_q[q-qs][i] = shard holding the i-th GT neighbour of
         // query q, or -1 if the id is unmapped (e.g. tombstoned).  Stores
         // duplicates: we want *neighbor-frequency* theoretical recall, which
@@ -506,13 +528,15 @@ public:
         std::vector<std::vector<int>> gt_shards_per_q(qe - qs);
         if (has_gt) {
             auto gt = ReadGroundTruth(gt_file);
-            for (size_t q = 0; q < nq; ++q) {
+            for (size_t q = 0; q < nq_orig; ++q) {
                 auto sorted = gt[q];
                 std::sort(sorted.begin(), sorted.end());
                 if ((int)sorted.size() >= num_neighbors)
                     dist_kth[q] = sorted[num_neighbors - 1].first;
             }
             for (size_t q = qs; q < qe; ++q) {
+                // First tile only: tile copies share the original's GT shards.
+                if (q >= nq_orig) continue;
                 auto& gt_q = gt[q];
                 const int kk = std::min((int)gt_q.size(), num_neighbors);
                 auto& shards = gt_shards_per_q[q - qs];
@@ -535,7 +559,10 @@ public:
             std::vector<std::vector<uint32_t>> send_qids(comm_size);
             std::vector<std::vector<float>>    send_qvecs(comm_size);
             for (size_t q = qs; q < qe; ++q) {
-                float* Q = queries.GetPoint(q);
+                // Tiled fetch: scaled query q reuses original vector (q%nq_orig).
+                // ALL nq scaled queries are fanned out so the timed window does the
+                // full scaled work; the scaled qid is carried so results route back.
+                float* Q = queries.GetPoint(q % nq_orig);
                 const auto& order = routing_order[q - qs];
                 const int np = std::min(nprobe, (int)order.size());
                 for (int pi = 0; pi < np; ++pi) {
@@ -598,12 +625,15 @@ public:
             double max_t = 0.0;
             MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
-            // Merge results per query.
-            std::vector<NNVec> neighbors(nq);
+            // Merge results per query.  Recall is over the original query set, so
+            // neighbors is indexed by ORIGINAL qid and tile copies (qid >= nq_orig)
+            // are searched for timing but their results are discarded.
+            std::vector<NNVec> neighbors(nq_orig);
             for (int src = 0; src < comm_size; ++src) {
                 const size_t nres = rcv_rqids[src].size();
                 for (size_t j = 0; j < nres; ++j) {
                     const uint32_t qid = rcv_rqids[src][j];
+                    if (qid >= (uint32_t)nq_orig) continue;   // first tile only
                     for (int nn = 0; nn < num_neighbors; ++nn)
                         neighbors[qid].push_back({
                             rcv_rdists[src][j * num_neighbors + nn],
@@ -611,6 +641,7 @@ public:
                 }
             }
             for (size_t q = qs; q < qe; ++q) {
+                if (q >= nq_orig) continue;   // first tile only
                 auto& nv = neighbors[q];
                 std::sort(nv.begin(), nv.end());
                 nv.erase(std::unique(nv.begin(), nv.end(),
@@ -633,6 +664,9 @@ public:
                 double   my_theo_sum    = 0.0;
                 uint64_t my_theo_counted = 0;
                 for (size_t q = qs; q < qe; ++q) {
+                    // Recall over the original query set only (first tile); tile
+                    // copies carry no retained neighbours and share original GT.
+                    if (q >= nq_orig) continue;
                     for (const auto& [dist, id] : neighbors[q])
                         if (dist <= dist_kth[q]) ++my_hits;
 
@@ -663,13 +697,19 @@ public:
                 MPI_Reduce(local_acc, global_acc, 3, MPI_DOUBLE,
                            MPI_SUM, 0, MPI_COMM_WORLD);
                 if (rank == 0) {
-                    recall = global_acc[0] / ((double)nq * num_neighbors);
+                    // Denominator = number of ORIGINAL queries actually evaluated =
+                    // min(nq, nq_orig).  Upscaling => full original set; downscaling
+                    // (nq < nq_orig) => recall over the searched first-nq subset.
+                    const size_t nq_recall = std::min(nq, nq_orig);
+                    recall = nq_recall > 0
+                        ? global_acc[0] / ((double)nq_recall * num_neighbors) : -1.0;
                     theoretical_recall = global_acc[2] > 0
                         ? global_acc[1] / global_acc[2] : -1.0;
                 }
             }
 
-            results.push_back({nprobe, max_t, recall, theoretical_recall});
+            // scaled_nq = nq drives QPS (timed window processed all nq queries).
+            results.push_back({nprobe, max_t, recall, theoretical_recall, nq});
         }
 
         return results;
@@ -689,13 +729,23 @@ int main(int argc, const char* argv[]) {
 
     if (rank != 0) std::cout.setstate(std::ios_base::failbit);
 
-    if (argc < 7 || argc > 8) {
+    if (argc < 7) {
         if (rank == 0)
             std::cerr <<
                 "Usage: mpirun -np <K> ./DistributedInsertBenchSweep"
                 " <base.fbin> <queries.fbin> <partition-file>"
                 " <gt-prefix> <runbook.yaml>"
-                " <num-neighbors> [output-file]\n";
+                " <num-neighbors> [output-file]"
+                " [--search-scale <f> | --search-fraction <p>]\n"
+                "\n"
+                "  Search-query scaling (changes only SEARCH steps; pass at most one):\n"
+                "    --search-scale    <f>   tile the query batch by f (f>0); QPS is\n"
+                "                            reported over the scaled query count.\n"
+                "    --search-fraction <p>   auto-pick f so searched vectors are\n"
+                "                            fraction p of all (insert+delete+search)\n"
+                "                            vectors over the runbook (p in (0,1)).\n"
+                "  Recall and theoretical recall are computed once over the original\n"
+                "  query set + GT regardless of scaling.\n";
         MPI_Finalize(); return 1;
     }
 
@@ -705,8 +755,31 @@ int main(int argc, const char* argv[]) {
     const std::string gt_prefix      = argv[4];
     const std::string runbook_path   = argv[5];
     const int         num_neighbors  = std::stoi(argv[6]);
-    const std::string output_file    = (argc == 8)
-        ? argv[7] : "sweep_results.csv";
+
+    // Trailing args: an optional positional output-file plus optional scaling
+    // flags, in any order.
+    std::string output_file        = "sweep_results.csv";
+    double      search_scale_arg    = 1.0;   // --search-scale
+    double      search_fraction_arg = -1.0;  // --search-fraction (<0 = unset)
+    for (int ai = 7; ai < argc; ++ai) {
+        const std::string a = argv[ai];
+        if (a == "--search-scale" && ai + 1 < argc) {
+            search_scale_arg = std::stod(argv[++ai]);
+        } else if (a == "--search-fraction" && ai + 1 < argc) {
+            search_fraction_arg = std::stod(argv[++ai]);
+        } else if (!a.empty() && a[0] != '-') {
+            output_file = a;                 // positional output file
+        } else {
+            if (rank == 0)
+                std::cerr << "ERROR: unrecognised or incomplete argument: " << a << "\n";
+            MPI_Finalize(); return 1;
+        }
+    }
+    if (search_fraction_arg > 0.0 && search_scale_arg != 1.0) {
+        if (rank == 0)
+            std::cerr << "ERROR: pass only one of --search-scale / --search-fraction\n";
+        MPI_Finalize(); return 1;
+    }
 
     if (rank == 0) std::cout.clear();
 
@@ -750,6 +823,42 @@ int main(int argc, const char* argv[]) {
     // num_voting_neighbors = 3*num_shards so every shard gets a real distance
     // estimate regardless of which nprobe value we're sweeping.
     bench.num_voting_neighbors = 10*comm_size;
+
+    // ── Resolve the global search-query scale factor ─────────────────────────
+    // Derived purely from the runbook + the query count, both identical on every
+    // rank, so search_scale is computed identically everywhere (no broadcast) and
+    // every rank's per-search MPI collective sizes stay in lockstep.
+    //   --search-fraction p : updates  = total insert+delete vectors (fixed),
+    //                         base_vol = n_search_steps * nq_orig,
+    //                         target   = p/(1-p) * updates,  scale = target/base_vol.
+    //   --search-scale f    : scale    = f directly.
+    {
+        const long long nq_orig = (long long)queries.n;
+        long long n_search_steps = 0, update_vecs = 0;
+        for (const auto& op : rb.ops) {
+            if (op.type == Operation::Type::SEARCH) ++n_search_steps;
+            else // INSERT (incl. initial build) or DELETE
+                update_vecs += (long long)(op.end - op.start);
+        }
+        if (search_fraction_arg > 0.0) {
+            const double p = search_fraction_arg;
+            if (p >= 1.0) {
+                if (rank == 0) std::cerr << "ERROR: --search-fraction must be in (0,1)\n";
+                MPI_Finalize(); return 1;
+            }
+            const double base_vol   = (double)n_search_steps * (double)nq_orig;
+            const double target_vol = p / (1.0 - p) * (double)update_vecs;
+            bench.search_scale = (base_vol > 0.0) ? target_vol / base_vol : 1.0;
+        } else {
+            bench.search_scale = search_scale_arg;
+        }
+        if (bench.search_scale < 0.0) bench.search_scale = 0.0;
+        if (rank == 0)
+            std::cout << "search_scale=" << bench.search_scale
+                      << "  (update_vecs=" << update_vecs
+                      << ", search_steps=" << n_search_steps
+                      << ", nq_orig=" << nq_orig << ")\n\n";
+    }
 
     bool index_built = false;
 
@@ -861,8 +970,10 @@ int main(int argc, const char* argv[]) {
 
             if (rank == 0) {
                 for (const auto& r : sweep) {
+                    // QPS over the SCALED query count (the timed window processed
+                    // r.scaled_nq queries); equals queries.n when search_scale=1.
                     const double qps = r.elapsed > 0
-                        ? (double)queries.n / r.elapsed : 0.0;
+                        ? (double)r.scaled_nq / r.elapsed : 0.0;
                     std::cout << "  nprobe=" << r.nprobe
                               << "  time="   << r.elapsed << " s"
                               << "  QPS="    << qps;
