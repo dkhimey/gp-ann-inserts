@@ -8,6 +8,7 @@
 #include <mpi.h>
 #include <parlay/primitives.h>
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -208,7 +209,75 @@ public:
         }
     }
 
-    void BuildInShardIndex() {
+    // -----------------------------------------------------------------------
+    // Per-shard index cache.
+    //
+    // Building the in-shard HNSW is the dominant setup cost and is fully
+    // deterministic given (shard points, M, ef_construction, seed).  We can
+    // therefore persist each rank's index to disk after the first run and load
+    // it on subsequent runs, skipping both the point-set read and the build.
+    //
+    // The cache key encodes the partition file (the dataset/sharding identity)
+    // and the HNSW build parameters, so a different partitioning or a changed M
+    // / ef_construction yields a different path and is never silently reused.
+    //
+    // Files are written under ~/extra on each worker (resolved from $HOME, so
+    // every rank uses its own local directory).  Only the partition file's
+    // basename is used in the name so a fully-qualified partition path does not
+    // introduce sub-directories under ~/extra.
+    // -----------------------------------------------------------------------
+    std::string ShardIndexCacheDir() const {
+        const char* home = std::getenv("HOME");
+        std::filesystem::path dir =
+            (home && *home) ? std::filesystem::path(home) : std::filesystem::path(".");
+        dir /= "extra";
+        return dir.string();
+    }
+
+    std::string ShardIndexCachePath(const std::string& base) const {
+        const std::string stem = std::filesystem::path(base).filename().string();
+        std::filesystem::path p = ShardIndexCacheDir();
+        p /= stem + ".shard" + std::to_string(rank)
+             + ".M" + std::to_string(hnsw_parameters.M)
+             + ".efc" + std::to_string(hnsw_parameters.ef_construction)
+             + ".hnsw";
+        return p.string();
+    }
+
+    // Read just the (n, dim) header from a points file.  Used on a cache hit so
+    // that `dim` is set (needed by the router and searches) without reading the
+    // full shard point set.
+    void ReadDim(const std::string& point_set_file) {
+        std::ifstream in(point_set_file, std::ios::binary);
+        if (!in) throw std::runtime_error(
+            "ReadDim: cannot open '" + point_set_file + "'");
+        uint32_t n = 0, d = 0;
+        in.read(reinterpret_cast<char*>(&n), sizeof(uint32_t));
+        in.read(reinterpret_cast<char*>(&d), sizeof(uint32_t));
+        dim = (int)d;
+    }
+
+    // Load a previously serialized shard index.  Returns false if no cache file
+    // exists at `cache_path` (caller should then build).  `dim` must be set
+    // first (see ReadDim).  shard_point_ids / shard_points are intentionally
+    // left empty: HNSW labels are the global point IDs, so nothing else is
+    // needed for searching after a load.
+    bool LoadInShardIndex(const std::string& cache_path) {
+        if (!std::filesystem::exists(cache_path)) return false;
+        space = std::make_unique<SpaceT>(dim);
+        hnsw  = std::make_unique<hnswlib::HierarchicalNSW<float>>(
+            space.get(), cache_path);
+        hnsw->setEf(hnsw_parameters.ef_search);
+        std::cerr << "[rank " << rank << "] HNSW loaded from cache: "
+                  << hnsw->cur_element_count << " elements, dim=" << dim
+                  << " (" << cache_path << ")\n";
+        return true;
+    }
+
+    // Build the in-shard HNSW from the loaded shard point set.  When
+    // `cache_path` is non-empty the freshly built index is serialized there so
+    // future runs can skip the build via LoadInShardIndex.
+    void BuildInShardIndex(const std::string& cache_path = "") {
         space = std::make_unique<SpaceT>(dim);
         // Add 1 to capacity: hnswlib can have off-by-one issues when
         // max_elements == cur_element_count during the last insertion.
@@ -224,6 +293,15 @@ public:
         hnsw->setEf(hnsw_parameters.ef_search);
         std::cerr << "[rank " << rank << "] HNSW built: "
                   << hnsw->cur_element_count << " elements, dim=" << dim << "\n";
+        if (!cache_path.empty()) {
+            // Make sure the destination directory (e.g. ~/extra) exists.
+            std::error_code ec;
+            std::filesystem::create_directories(
+                std::filesystem::path(cache_path).parent_path(), ec);
+            hnsw->saveIndex(cache_path);
+            std::cerr << "[rank " << rank << "] HNSW saved to cache: "
+                      << cache_path << "\n";
+        }
         shard_points.Drop();
     }
 

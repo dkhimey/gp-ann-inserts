@@ -81,11 +81,27 @@ int main(int argc, const char* argv[]) {
 
     double t_setup = MPI_Wtime();
     std::cerr << "[rank " << rank << "] loading partition\n";
+    // The partition (point -> shard map) is always needed: it drives the shard
+    // point selection on a build, and the point-level theoretical-recall
+    // computation during the sweep.
     bench.LoadPartition(partition_file);
-    std::cerr << "[rank " << rank << "] loading shard points\n";
-    bench.LoadShardPointSet(point_file);
-    std::cerr << "[rank " << rank << "] building in-shard HNSW\n";
-    bench.BuildInShardIndex();
+
+    // Per-shard index: load from the on-disk cache if one exists for this
+    // (partition, M, ef_construction); otherwise build it and save it so the
+    // next run can skip the read+build.  On a cache hit we only need `dim`
+    // (cheap header read) — the full shard point set is never loaded.
+    const std::string shard_cache = bench.ShardIndexCachePath(partition_file);
+    if (std::filesystem::exists(shard_cache)) {
+        std::cerr << "[rank " << rank << "] loading cached in-shard HNSW\n";
+        bench.ReadDim(point_file);
+        bench.LoadInShardIndex(shard_cache);
+    } else {
+        std::cerr << "[rank " << rank << "] loading shard points\n";
+        bench.LoadShardPointSet(point_file);
+        std::cerr << "[rank " << rank << "] building in-shard HNSW\n";
+        bench.BuildInShardIndex(shard_cache);
+    }
+
     std::cerr << "[rank " << rank << "] loading router\n";
     bench.LoadRouter(router_file);
     std::cerr << "[rank " << rank << "] setup done in "
