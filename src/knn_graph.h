@@ -1,6 +1,8 @@
 #pragma once
 
 #include <iostream>
+#include <atomic>
+#include <chrono>
 #include <parlay/parallel.h>
 #include <parlay/primitives.h>
 #include <random>
@@ -112,6 +114,14 @@ struct ApproximateKNNGraphBuilder {
         }
 
         // recurse on clusters
+        if (depth == 0) {
+            sketch_clusters_done.store(0, std::memory_order_relaxed);
+            sketch_total_clusters = clusters.size();
+            sketch_phase_start = std::chrono::steady_clock::now();
+            sketch_last_print_ms.store(-120000, std::memory_order_relaxed);
+            if (!quiet)
+                std::cout << "Recursively sketching " << sketch_total_clusters << " top-level clusters..." << std::endl;
+        }
         SpinLock bucket_lock;
         parlay::parallel_for(
                 0, clusters.size(),
@@ -136,6 +146,26 @@ struct ApproximateKNNGraphBuilder {
                     bucket_lock.lock();
                     buckets.insert(buckets.end(), recursive_buckets.begin(), recursive_buckets.end());
                     bucket_lock.unlock();
+
+                    if (depth == 0) {
+                        size_t c = sketch_clusters_done.fetch_add(1, std::memory_order_relaxed) + 1;
+                        int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - sketch_phase_start).count();
+                        int64_t prev = sketch_last_print_ms.load(std::memory_order_relaxed);
+                        bool time_to_print = (elapsed_ms - prev >= 120000) || (c == sketch_total_clusters);
+                        if (!quiet && time_to_print &&
+                                sketch_last_print_ms.compare_exchange_strong(prev, elapsed_ms, std::memory_order_relaxed)) {
+                            double pct = 100.0 * c / sketch_total_clusters;
+                            double elapsed_s = elapsed_ms / 1000.0;
+                            double eta_s = (c > 0 && c < sketch_total_clusters)
+                                    ? elapsed_s * (sketch_total_clusters - c) / c : 0.0;
+                            std::cout << "[" << (int)(elapsed_s / 60) << "m" << ((int)elapsed_s % 60) << "s] "
+                                      << "Sketch clusters " << c << " / " << sketch_total_clusters
+                                      << " (" << (int)pct << "%)"
+                                      << "  ETA: " << (int)(eta_s / 60) << "m" << ((int)eta_s % 60) << "s"
+                                      << std::endl;
+                        }
+                    }
                 },
                 1);
 
@@ -210,6 +240,11 @@ struct ApproximateKNNGraphBuilder {
 
         timer.Start();
 
+        std::atomic<size_t> buckets_done{0};
+        const size_t total_buckets = buckets.size();
+        const auto bf_start_time = std::chrono::steady_clock::now();
+        std::atomic<int64_t> last_print_ms{-120000}; // forces first print immediately
+
         parlay::parallel_for(
                 0, buckets.size(),
                 [&](size_t bucket_id) {
@@ -235,6 +270,26 @@ struct ApproximateKNNGraphBuilder {
                     }
                     bucket.clear();
                     bucket.shrink_to_fit();
+
+                    {
+                        size_t c = buckets_done.fetch_add(1, std::memory_order_relaxed) + 1;
+                        int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - bf_start_time).count();
+                        int64_t prev = last_print_ms.load(std::memory_order_relaxed);
+                        bool time_to_print = (elapsed_ms - prev >= 120000) || (c == total_buckets);
+                        if (!quiet && time_to_print &&
+                                last_print_ms.compare_exchange_strong(prev, elapsed_ms, std::memory_order_relaxed)) {
+                            double pct = 100.0 * c / total_buckets;
+                            double elapsed_s = elapsed_ms / 1000.0;
+                            double eta_s = (c > 0 && c < total_buckets)
+                                    ? elapsed_s * (total_buckets - c) / c : 0.0;
+                            std::cout << "[" << (int)(elapsed_s / 60) << "m" << ((int)elapsed_s % 60) << "s] "
+                                      << "Buckets " << c << " / " << total_buckets
+                                      << " (" << (int)pct << "%)"
+                                      << "  ETA: " << (int)(eta_s / 60) << "m" << ((int)eta_s % 60) << "s"
+                                      << std::endl;
+                        }
+                    }
                 },
                 1);
 
@@ -250,6 +305,40 @@ struct ApproximateKNNGraphBuilder {
         return graph;
     }
 
+
+    ApproximateKNNGraphBuilder() = default;
+
+    ApproximateKNNGraphBuilder(const ApproximateKNNGraphBuilder& o)
+        : sketch_clusters_done(0), sketch_total_clusters(o.sketch_total_clusters),
+          sketch_phase_start(o.sketch_phase_start), sketch_last_print_ms(-120000),
+          seed(o.seed), FRACTION_LEADERS(o.FRACTION_LEADERS),
+          TOP_LEVEL_NUM_LEADERS(o.TOP_LEVEL_NUM_LEADERS), MAX_NUM_LEADERS(o.MAX_NUM_LEADERS),
+          MAX_CLUSTER_SIZE(o.MAX_CLUSTER_SIZE), MIN_CLUSTER_SIZE(o.MIN_CLUSTER_SIZE),
+          MAX_MERGED_CLUSTER_SIZE(o.MAX_MERGED_CLUSTER_SIZE), REPETITIONS(o.REPETITIONS),
+          FANOUT(o.FANOUT), MAX_DEPTH(o.MAX_DEPTH), CONCERNING_DEPTH(o.CONCERNING_DEPTH),
+          TOO_SMALL_SHRINKAGE_FRACTION(o.TOO_SMALL_SHRINKAGE_FRACTION),
+          quiet(o.quiet), timer(o.timer) {}
+
+    ApproximateKNNGraphBuilder& operator=(const ApproximateKNNGraphBuilder& o) {
+        if (this == &o) return *this;
+        sketch_clusters_done.store(0, std::memory_order_relaxed);
+        sketch_total_clusters = o.sketch_total_clusters;
+        sketch_phase_start = o.sketch_phase_start;
+        sketch_last_print_ms.store(-120000, std::memory_order_relaxed);
+        seed = o.seed; FRACTION_LEADERS = o.FRACTION_LEADERS;
+        TOP_LEVEL_NUM_LEADERS = o.TOP_LEVEL_NUM_LEADERS; MAX_NUM_LEADERS = o.MAX_NUM_LEADERS;
+        MAX_CLUSTER_SIZE = o.MAX_CLUSTER_SIZE; MIN_CLUSTER_SIZE = o.MIN_CLUSTER_SIZE;
+        MAX_MERGED_CLUSTER_SIZE = o.MAX_MERGED_CLUSTER_SIZE; REPETITIONS = o.REPETITIONS;
+        FANOUT = o.FANOUT; MAX_DEPTH = o.MAX_DEPTH; CONCERNING_DEPTH = o.CONCERNING_DEPTH;
+        TOO_SMALL_SHRINKAGE_FRACTION = o.TOO_SMALL_SHRINKAGE_FRACTION;
+        quiet = o.quiet; timer = o.timer;
+        return *this;
+    }
+
+    std::atomic<size_t> sketch_clusters_done{0};
+    size_t sketch_total_clusters{0};
+    std::chrono::steady_clock::time_point sketch_phase_start;
+    std::atomic<int64_t> sketch_last_print_ms{-120000};
 
     int seed = 555;
     double FRACTION_LEADERS = 0.005;
