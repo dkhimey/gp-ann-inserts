@@ -34,8 +34,10 @@
 #include <algorithm>
 #include <cassert>
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <numeric>
@@ -283,6 +285,58 @@ public:
         MPI_Comm_rank(MPI_COMM_WORLD, &rank);
         MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
         num_shards = comm_size;
+    }
+
+    // -----------------------------------------------------------------------
+    // Write a resumable snapshot of the whole distributed index into `dir`:
+    //   <dir>/shard_<rank>.hnsw                  per-shard HNSW   (every rank)
+    //   <dir>/router_<rank>.hnsw                 routing HNSW     (every rank)
+    //   <dir>/router_<rank>.hnsw.routing_index_partition
+    //                                            routing partition (every rank)
+    //   <dir>/label_to_shard.bin                 label→shard map  (rank 0 only)
+    //   <dir>/checkpoint.meta                    scalar metadata  (rank 0 only)
+    //
+    // label_to_shard is kept identical on every rank (synced via Allgatherv in
+    // ProcessInserts / erased in lockstep in ProcessDeletes), so rank 0 writes
+    // it once.  `next_op_idx` is the runbook op a resumed run should start from.
+    void SaveCheckpoint(const std::string& dir,
+                        size_t next_op_idx, size_t max_pts) {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if (ec && rank == 0)
+            std::cerr << "  [checkpoint] WARNING: create_directories('" << dir
+                      << "') failed: " << ec.message() << "\n";
+
+        // Each rank serialises its own shard index and its own router copy.
+        // HNSWRouter::Serialize also emits "<file>.routing_index_partition".
+        if (local_hnsw)
+            local_hnsw->saveIndex(dir + "/shard_"  + std::to_string(rank) + ".hnsw");
+        if (router)
+            router->Serialize(dir + "/router_" + std::to_string(rank) + ".hnsw");
+
+        // Rank 0 writes the replicated, shard-independent state once.
+        if (rank == 0) {
+            {
+                std::ofstream out(dir + "/label_to_shard.bin", std::ios::binary);
+                const uint64_t n = label_to_shard.size();
+                out.write(reinterpret_cast<const char*>(&n), sizeof(n));
+                for (const auto& [label, shard] : label_to_shard) {
+                    out.write(reinterpret_cast<const char*>(&label), sizeof(label));
+                    out.write(reinterpret_cast<const char*>(&shard), sizeof(shard));
+                }
+            }
+            std::ofstream meta(dir + "/checkpoint.meta");
+            meta << "next_op_idx "         << next_op_idx          << "\n"
+                 << "num_shards "           << num_shards           << "\n"
+                 << "dim "                  << dim                  << "\n"
+                 << "max_pts "              << max_pts              << "\n"
+                 << "num_neighbors "        << num_neighbors        << "\n"
+                 << "num_voting_neighbors " << num_voting_neighbors << "\n"
+                 << "search_scale "         << search_scale         << "\n";
+        }
+
+        // No rank advances until the whole snapshot is on disk.
+        MPI_Barrier(MPI_COMM_WORLD);
     }
 
     // -----------------------------------------------------------------------
@@ -860,6 +914,19 @@ int main(int argc, const char* argv[]) {
                       << ", nq_orig=" << nq_orig << ")\n\n";
     }
 
+    // ── Checkpointing ────────────────────────────────────────────────────────
+    // Every CHECKPOINT_EVERY runbook ops we snapshot the full distributed index
+    // (each shard + each rank's router) plus the shared routing/label metadata
+    // under $HOME/extra, so a crashed run can be resumed without replaying the
+    // whole runbook.  Each checkpoint lives in its own step-keyed subdirectory.
+    constexpr size_t CHECKPOINT_EVERY = 50;
+    const char* home_env = std::getenv("HOME");
+    const std::string checkpoint_root =
+        std::string(home_env && *home_env ? home_env : ".") + "/extra";
+    if (rank == 0)
+        std::cout << "Checkpoints: every " << CHECKPOINT_EVERY
+                  << " ops -> " << checkpoint_root << "/checkpoint_step*\n\n";
+
     bool index_built = false;
 
     for (size_t op_idx = 0; op_idx < rb.ops.size(); ++op_idx) {
@@ -998,6 +1065,20 @@ int main(int argc, const char* argv[]) {
                 }
                 csv.flush();
             }
+        }
+
+        // ── Periodic checkpoint ───────────────────────────────────────────
+        // Snapshot after every CHECKPOINT_EVERY ops (once the index exists).
+        if (index_built && (op_idx + 1) % CHECKPOINT_EVERY == 0) {
+            std::ostringstream dir;
+            dir << checkpoint_root << "/checkpoint_step"
+                << std::setw(6) << std::setfill('0') << (op_idx + 1);
+            if (rank == 0)
+                std::cout << "  [checkpoint] writing snapshot to "
+                          << dir.str() << " …\n";
+            bench.SaveCheckpoint(dir.str(), op_idx + 1, rb.max_pts);
+            if (rank == 0)
+                std::cout << "  [checkpoint] done\n";
         }
     }
 
