@@ -340,6 +340,87 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // Reconstruct the benchmark state from a checkpoint written by
+    // SaveCheckpoint and return the runbook op index to resume from.  Mirrors
+    // SaveCheckpoint exactly: every rank loads its own shard index + router and
+    // the replicated label→shard map; scalar metadata comes from checkpoint.meta.
+    // After this returns the index is "built": the caller must NOT call
+    // BuildInitial again, and should start the runbook loop at the returned op.
+    size_t LoadCheckpoint(const std::string& dir) {
+        // --- scalar metadata ---
+        size_t next_op_idx = 0;
+        {
+            std::ifstream meta(dir + "/checkpoint.meta");
+            if (!meta)
+                throw std::runtime_error("Cannot open checkpoint meta: "
+                                         + dir + "/checkpoint.meta");
+            std::string key;
+            while (meta >> key) {
+                if      (key == "next_op_idx")          meta >> next_op_idx;
+                else if (key == "dim")                  meta >> dim;
+                else if (key == "num_neighbors")        meta >> num_neighbors;
+                else if (key == "num_voting_neighbors") meta >> num_voting_neighbors;
+                else if (key == "search_scale")         meta >> search_scale;
+                else if (key == "num_shards") {
+                    int v; meta >> v;
+                    if (v != num_shards)
+                        throw std::runtime_error(
+                            "checkpoint num_shards (" + std::to_string(v) +
+                            ") != comm_size (" + std::to_string(num_shards) +
+                            "); rerun with the same -np");
+                } else {
+                    std::string rest; std::getline(meta, rest);  // skip unknown
+                }
+            }
+        }
+
+        // --- distance space + this rank's shard index ---
+        space = std::make_unique<
+#ifdef MIPS_DISTANCE
+            hnswlib::InnerProductSpace
+#else
+            hnswlib::L2Space
+#endif
+        >(dim);
+        const std::string shard_path =
+            dir + "/shard_" + std::to_string(rank) + ".hnsw";
+        // max_elements = 0 -> keep the capacity saved in the index; subsequent
+        // ProcessInserts auto-resize if a later batch overflows it.
+        local_hnsw = std::make_unique<hnswlib::HierarchicalNSW<float>>(
+            space.get(), shard_path);
+        local_hnsw->setEf(200);   // matches BuildInitial's local search ef
+
+        // --- this rank's router (HNSW + companion routing partition) ---
+        const std::string router_path =
+            dir + "/router_" + std::to_string(rank) + ".hnsw";
+        routing_partition =
+            ReadMetisPartition(router_path + ".routing_index_partition");
+        router = std::make_unique<HNSWRouter>(router_path, dim, routing_partition);
+        router->hnsw->setEf(100);  // matches BuildInitial's routing ef
+
+        // --- replicated label->shard map (identical on every rank) ---
+        {
+            std::ifstream in(dir + "/label_to_shard.bin", std::ios::binary);
+            if (!in)
+                throw std::runtime_error("Cannot open "
+                                         + dir + "/label_to_shard.bin");
+            uint64_t n = 0;
+            in.read(reinterpret_cast<char*>(&n), sizeof(n));
+            label_to_shard.clear();
+            label_to_shard.reserve(n);
+            for (uint64_t i = 0; i < n; ++i) {
+                uint32_t label; int32_t shard;
+                in.read(reinterpret_cast<char*>(&label), sizeof(label));
+                in.read(reinterpret_cast<char*>(&shard), sizeof(shard));
+                label_to_shard[label] = shard;
+            }
+        }
+
+        MPI_Barrier(MPI_COMM_WORLD);
+        return next_op_idx;
+    }
+
+    // -----------------------------------------------------------------------
     void BuildInitial(const std::string& point_file,
                       const Clusters& clusters,
                       size_t max_pts,
@@ -790,7 +871,12 @@ int main(int argc, const char* argv[]) {
                 " <base.fbin> <queries.fbin> <partition-file>"
                 " <gt-prefix> <runbook.yaml>"
                 " <num-neighbors> [output-file]"
-                " [--search-scale <f> | --search-fraction <p>]\n"
+                " [--search-scale <f> | --search-fraction <p>] [--resume <dir>]\n"
+                "\n"
+                "  --resume <dir>  resume from a checkpoint directory written under\n"
+                "                  $HOME/extra (e.g. .../checkpoint_step000050): the\n"
+                "                  index is loaded instead of rebuilt and the runbook\n"
+                "                  continues from the saved op.  Output is appended.\n"
                 "\n"
                 "  Search-query scaling (changes only SEARCH steps; pass at most one):\n"
                 "    --search-scale    <f>   tile the query batch by f (f>0); QPS is\n"
@@ -813,6 +899,7 @@ int main(int argc, const char* argv[]) {
     // Trailing args: an optional positional output-file plus optional scaling
     // flags, in any order.
     std::string output_file        = "sweep_results.csv";
+    std::string resume_dir;                  // --resume (empty = fresh run)
     double      search_scale_arg    = 1.0;   // --search-scale
     double      search_fraction_arg = -1.0;  // --search-fraction (<0 = unset)
     for (int ai = 7; ai < argc; ++ai) {
@@ -821,6 +908,8 @@ int main(int argc, const char* argv[]) {
             search_scale_arg = std::stod(argv[++ai]);
         } else if (a == "--search-fraction" && ai + 1 < argc) {
             search_fraction_arg = std::stod(argv[++ai]);
+        } else if (a == "--resume" && ai + 1 < argc) {
+            resume_dir = argv[++ai];
         } else if (!a.empty() && a[0] != '-') {
             output_file = a;                 // positional output file
         } else {
@@ -847,20 +936,28 @@ int main(int argc, const char* argv[]) {
                   << "shards  : " << comm_size << "\n"
                   << "output  : " << output_file << "\n\n";
 
-    // Open CSV on rank 0.
+    // Open CSV on rank 0 in APPEND mode so a rerun (or a --resume continuation)
+    // never truncates existing results.  The header is written only when the
+    // file is newly created or empty, so appended runs don't repeat it.
     std::ofstream csv;
     if (rank == 0) {
-        csv.open(output_file);
+        std::error_code ec;
+        const bool had_content =
+            std::filesystem::exists(output_file, ec) &&
+            std::filesystem::file_size(output_file, ec) > 0;
+        csv.open(output_file, std::ios::app);
         if (!csv) {
             std::cerr << "Cannot open output file: " << output_file << "\n";
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
-        csv << "step,operation,nprobe,range_start,range_end,"
-            << "time_s,qps_or_throughput,recall@" << num_neighbors
-            << ",theoretical_recall";
-        for (int r = 0; r < comm_size; ++r)
-            csv << ",shard_" << r << "_slots,shard_" << r << "_active";
-        csv << "\n";
+        if (!had_content) {
+            csv << "step,operation,nprobe,range_start,range_end,"
+                << "time_s,qps_or_throughput,recall@" << num_neighbors
+                << ",theoretical_recall";
+            for (int r = 0; r < comm_size; ++r)
+                csv << ",shard_" << r << "_slots,shard_" << r << "_active";
+            csv << "\n";
+        }
     }
 
     if (rank != 0) std::cout.setstate(std::ios_base::failbit);
@@ -927,9 +1024,38 @@ int main(int argc, const char* argv[]) {
         std::cout << "Checkpoints: every " << CHECKPOINT_EVERY
                   << " ops -> " << checkpoint_root << "/checkpoint_step*\n\n";
 
-    bool index_built = false;
+    bool   index_built = false;
+    size_t start_op    = 0;
 
-    for (size_t op_idx = 0; op_idx < rb.ops.size(); ++op_idx) {
+    // ── Resume from a checkpoint, if requested ───────────────────────────────
+    // Load the saved index/router/metadata instead of building, and continue the
+    // runbook from the op recorded in the checkpoint.  LoadCheckpoint overrides
+    // dim / num_neighbors / num_voting_neighbors / search_scale with the values
+    // the original run used, so the continuation stays consistent.
+    if (!resume_dir.empty()) {
+        if (rank == 0)
+            std::cout << "Resuming from checkpoint " << resume_dir << " …\n";
+        if (rank != 0) std::cout.setstate(std::ios_base::failbit);
+        try {
+            start_op = bench.LoadCheckpoint(resume_dir);
+        } catch (const std::exception& e) {
+            std::cout.clear();
+            if (rank == 0)
+                std::cerr << "ERROR: failed to resume from " << resume_dir
+                          << ": " << e.what() << "\n";
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        if (rank == 0) std::cout.clear();
+        index_built = true;
+        if (start_op > rb.ops.size()) start_op = rb.ops.size();
+        if (rank == 0)
+            std::cout << "  resumed at op " << start_op << " / " << rb.ops.size()
+                      << "  (dim=" << bench.dim
+                      << ", num_neighbors=" << bench.num_neighbors
+                      << ", search_scale=" << bench.search_scale << ")\n\n";
+    }
+
+    for (size_t op_idx = start_op; op_idx < rb.ops.size(); ++op_idx) {
         const Operation& op = rb.ops[op_idx];
 
         // ── INSERT ────────────────────────────────────────────────────────
