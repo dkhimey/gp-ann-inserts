@@ -216,6 +216,45 @@ static void AllToAllV(const std::vector<std::vector<T>>& send_bufs,
         recv_bufs[r].assign(rf.begin() + rd[r], rf.begin() + rd[r] + rc[r]);
 }
 
+// Byte size hnswlib's saveIndex produces for `h` (mirrors its on-disk format),
+// used to detect short writes, e.g. from a full disk.
+static uintmax_t ExpectedHnswFileSize(const hnswlib::HierarchicalNSW<float>& h) {
+    uintmax_t n = sizeof(h.offsetLevel0_) + sizeof(h.max_elements_)
+                + sizeof(h.cur_element_count) + sizeof(h.size_data_per_element_)
+                + sizeof(h.label_offset_) + sizeof(h.offsetData_)
+                + sizeof(h.maxlevel_) + sizeof(h.enterpoint_node_)
+                + sizeof(h.maxM_) + sizeof(h.maxM0_) + sizeof(h.M_)
+                + sizeof(h.mult_) + sizeof(h.ef_construction_);
+    const size_t count = h.cur_element_count;
+    n += uintmax_t(count) * h.size_data_per_element_;
+    for (size_t i = 0; i < count; ++i) {
+        n += sizeof(unsigned int);
+        if (h.element_levels_[i] > 0)
+            n += uintmax_t(h.size_links_per_element_) * h.element_levels_[i];
+    }
+    return n;
+}
+
+// Byte size WriteMetisPartition produces for `partition`.
+static uintmax_t ExpectedPartitionFileSize(const std::vector<int>& partition) {
+    uintmax_t n = 0;
+    for (int v : partition) n += std::to_string(v).size() + 1;
+    return n;
+}
+
+static bool FileHasSize(const std::string& path, uintmax_t expected) {
+    std::error_code ec;
+    const uintmax_t actual = std::filesystem::file_size(path, ec);
+    if (ec || actual != expected) {
+        std::cerr << "  [checkpoint] ERROR: " << path << " has "
+                  << (ec ? std::string("no size (") + ec.message() + ")"
+                         : std::to_string(actual) + " bytes")
+                  << ", expected " << expected << "\n";
+        return false;
+    }
+    return true;
+}
+
 
 // ---------------------------------------------------------------------------
 // Benchmark class (same as distributed_insert_bench; ProcessSearch extended
@@ -225,6 +264,9 @@ static void AllToAllV(const std::vector<std::vector<T>>& send_bufs,
 class DistributedInsertBenchmark {
 public:
     int rank = 0, comm_size = 1, num_shards = 1, dim = 0;
+    // Rank within this host.  $HOME/extra is node-local, so local rank 0 of
+    // each host writes the replicated checkpoint files and prunes old ones.
+    int node_rank = 0;
     int num_neighbors        = 10;
     int num_voting_neighbors = 100;
     // Search-query scaling factor (1.0 = no scaling).  During a search step the
@@ -285,6 +327,12 @@ public:
         MPI_Comm_rank(MPI_COMM_WORLD, &rank);
         MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
         num_shards = comm_size;
+
+        MPI_Comm node_comm;
+        MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank,
+                            MPI_INFO_NULL, &node_comm);
+        MPI_Comm_rank(node_comm, &node_rank);
+        MPI_Comm_free(&node_comm);
     }
 
     // -----------------------------------------------------------------------
@@ -293,50 +341,87 @@ public:
     //   <dir>/router_<rank>.hnsw                 routing HNSW     (every rank)
     //   <dir>/router_<rank>.hnsw.routing_index_partition
     //                                            routing partition (every rank)
-    //   <dir>/label_to_shard.bin                 label→shard map  (rank 0 only)
-    //   <dir>/checkpoint.meta                    scalar metadata  (rank 0 only)
+    //   <dir>/label_to_shard.bin                 label→shard map  (one rank per node)
+    //   <dir>/checkpoint.meta                    scalar metadata  (one rank per node)
     //
-    // label_to_shard is kept identical on every rank (synced via Allgatherv in
-    // ProcessInserts / erased in lockstep in ProcessDeletes), so rank 0 writes
-    // it once.  `next_op_idx` is the runbook op a resumed run should start from.
-    void SaveCheckpoint(const std::string& dir,
+    // `dir` is on node-local storage, so each node's copy holds only its own
+    // ranks' shard/router files.  label_to_shard is kept identical on every rank
+    // (synced via Allgatherv in ProcessInserts / erased in lockstep in
+    // ProcessDeletes), so each node's leader writes it once for its ranks to
+    // load on resume.  `next_op_idx` is the runbook op a resumed run starts from.
+    //
+    // Collective.  Returns true on every rank iff every rank wrote and verified
+    // all of its files; returns only after all ranks have finished writing.
+    bool SaveCheckpoint(const std::string& dir,
                         size_t next_op_idx, size_t max_pts) {
-        std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
-        if (ec && rank == 0)
-            std::cerr << "  [checkpoint] WARNING: create_directories('" << dir
-                      << "') failed: " << ec.message() << "\n";
+        int ok = 1;
+        try {
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            if (ec) {
+                std::cerr << "  [checkpoint] ERROR (rank " << rank
+                          << "): create_directories('" << dir
+                          << "') failed: " << ec.message() << "\n";
+                ok = 0;
+            }
 
-        // Each rank serialises its own shard index and its own router copy.
-        // HNSWRouter::Serialize also emits "<file>.routing_index_partition".
-        if (local_hnsw)
-            local_hnsw->saveIndex(dir + "/shard_"  + std::to_string(rank) + ".hnsw");
-        if (router)
-            router->Serialize(dir + "/router_" + std::to_string(rank) + ".hnsw");
+            // Each rank serialises its own shard index and its own router copy.
+            // HNSWRouter::Serialize also emits "<file>.routing_index_partition".
+            // saveIndex doesn't report I/O errors, so check the resulting sizes.
+            if (ok && local_hnsw) {
+                const std::string f = dir + "/shard_" + std::to_string(rank) + ".hnsw";
+                local_hnsw->saveIndex(f);
+                ok &= FileHasSize(f, ExpectedHnswFileSize(*local_hnsw));
+            }
+            if (ok && router) {
+                const std::string f = dir + "/router_" + std::to_string(rank) + ".hnsw";
+                router->Serialize(f);
+                ok &= FileHasSize(f, ExpectedHnswFileSize(*router->hnsw));
+                ok &= FileHasSize(f + ".routing_index_partition",
+                                  ExpectedPartitionFileSize(router->partition));
+            }
 
-        // Rank 0 writes the replicated, shard-independent state once.
-        if (rank == 0) {
-            {
-                std::ofstream out(dir + "/label_to_shard.bin", std::ios::binary);
-                const uint64_t n = label_to_shard.size();
-                out.write(reinterpret_cast<const char*>(&n), sizeof(n));
-                for (const auto& [label, shard] : label_to_shard) {
-                    out.write(reinterpret_cast<const char*>(&label), sizeof(label));
-                    out.write(reinterpret_cast<const char*>(&shard), sizeof(shard));
+            // One rank per node writes the replicated, shard-independent state.
+            if (ok && node_rank == 0) {
+                const std::string lf = dir + "/label_to_shard.bin";
+                {
+                    std::ofstream out(lf, std::ios::binary);
+                    const uint64_t n = label_to_shard.size();
+                    out.write(reinterpret_cast<const char*>(&n), sizeof(n));
+                    for (const auto& [label, shard] : label_to_shard) {
+                        out.write(reinterpret_cast<const char*>(&label), sizeof(label));
+                        out.write(reinterpret_cast<const char*>(&shard), sizeof(shard));
+                    }
+                    out.close();
+                    ok &= static_cast<bool>(out);
+                }
+                ok &= FileHasSize(lf, sizeof(uint64_t) + label_to_shard.size() *
+                                          (sizeof(uint32_t) + sizeof(int32_t)));
+
+                // Written last: its presence marks a complete snapshot.
+                if (ok) {
+                    std::ofstream meta(dir + "/checkpoint.meta");
+                    meta << "next_op_idx "         << next_op_idx          << "\n"
+                         << "num_shards "           << num_shards           << "\n"
+                         << "dim "                  << dim                  << "\n"
+                         << "max_pts "              << max_pts              << "\n"
+                         << "num_neighbors "        << num_neighbors        << "\n"
+                         << "num_voting_neighbors " << num_voting_neighbors << "\n"
+                         << "search_scale "         << search_scale         << "\n";
+                    meta.close();
+                    ok &= static_cast<bool>(meta);
                 }
             }
-            std::ofstream meta(dir + "/checkpoint.meta");
-            meta << "next_op_idx "         << next_op_idx          << "\n"
-                 << "num_shards "           << num_shards           << "\n"
-                 << "dim "                  << dim                  << "\n"
-                 << "max_pts "              << max_pts              << "\n"
-                 << "num_neighbors "        << num_neighbors        << "\n"
-                 << "num_voting_neighbors " << num_voting_neighbors << "\n"
-                 << "search_scale "         << search_scale         << "\n";
+        } catch (const std::exception& e) {
+            std::cerr << "  [checkpoint] ERROR (rank " << rank << "): "
+                      << e.what() << "\n";
+            ok = 0;
         }
 
-        // No rank advances until the whole snapshot is on disk.
-        MPI_Barrier(MPI_COMM_WORLD);
+        // Also acts as the barrier: no rank advances until every rank is done.
+        int all_ok = 0;
+        MPI_Allreduce(&ok, &all_ok, 1, MPI_INT, MPI_LAND, MPI_COMM_WORLD);
+        return all_ok != 0;
     }
 
     // -----------------------------------------------------------------------
@@ -1014,8 +1099,9 @@ int main(int argc, const char* argv[]) {
     // ── Checkpointing ────────────────────────────────────────────────────────
     // Every CHECKPOINT_EVERY runbook ops we snapshot the full distributed index
     // (each shard + each rank's router) plus the shared routing/label metadata
-    // under $HOME/extra, so a crashed run can be resumed without replaying the
-    // whole runbook.  Each checkpoint lives in its own step-keyed subdirectory.
+    // under $HOME/extra (node-local), so a crashed run can be resumed without replaying the
+    // whole runbook.  Each checkpoint lives in its own step-keyed subdirectory;
+    // only the newest complete one is kept.
     constexpr size_t CHECKPOINT_EVERY = 50;
     const char* home_env = std::getenv("HOME");
     const std::string checkpoint_root =
@@ -1026,6 +1112,8 @@ int main(int argc, const char* argv[]) {
 
     bool   index_built = false;
     size_t start_op    = 0;
+    // Newest complete checkpoint; deleted once a newer one is verified.
+    std::string prev_checkpoint = resume_dir;
 
     // ── Resume from a checkpoint, if requested ───────────────────────────────
     // Load the saved index/router/metadata instead of building, and continue the
@@ -1202,9 +1290,38 @@ int main(int argc, const char* argv[]) {
             if (rank == 0)
                 std::cout << "  [checkpoint] writing snapshot to "
                           << dir.str() << " …\n";
-            bench.SaveCheckpoint(dir.str(), op_idx + 1, rb.max_pts);
-            if (rank == 0)
-                std::cout << "  [checkpoint] done\n";
+            const bool saved = bench.SaveCheckpoint(dir.str(), op_idx + 1, rb.max_pts);
+
+            // SaveCheckpoint has synced all ranks; each node's leader prunes its
+            // own node-local copy.
+            if (bench.node_rank == 0) {
+                namespace fs = std::filesystem;
+                std::error_code ec;
+                if (saved) {
+                    if (rank == 0) std::cout << "  [checkpoint] done\n";
+                    if (!prev_checkpoint.empty() &&
+                        fs::weakly_canonical(prev_checkpoint, ec) !=
+                        fs::weakly_canonical(dir.str(), ec)) {
+                        if (rank == 0)
+                            std::cout << "  [checkpoint] removing previous "
+                                      << prev_checkpoint << " on every node\n";
+                        fs::remove_all(prev_checkpoint, ec);
+                        if (ec)
+                            std::cerr << "  [checkpoint] WARNING (rank " << rank
+                                      << "): could not remove " << prev_checkpoint
+                                      << ": " << ec.message() << "\n";
+                    }
+                } else {
+                    // Keep the previous checkpoint; drop the incomplete one to free space.
+                    if (rank == 0)
+                        std::cerr << "  [checkpoint] FAILED; keeping "
+                                  << (prev_checkpoint.empty() ? "(none)" : prev_checkpoint)
+                                  << " and removing incomplete " << dir.str()
+                                  << " on every node\n";
+                    fs::remove_all(dir.str(), ec);
+                }
+            }
+            if (saved) prev_checkpoint = dir.str();
         }
     }
 
