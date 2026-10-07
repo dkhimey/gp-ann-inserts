@@ -1,6 +1,6 @@
 #include "dist.h"
 
-#include "../external/hnswlib/hnswlib/space_l2.h"
+#include "../external/hnswlib/hnswlib/hnswlib.h"  // not space_l2.h directly: in this hnswlib it must come after hnswlib.h
 
 #include <iostream>
 #include <math.h>

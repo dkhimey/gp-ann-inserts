@@ -4,9 +4,6 @@
 [submodule "external/KaMinPar"]
 	path = external/KaMinPar
 	url = git@github.com:KaHIP/KaMinPar.git
-[submodule "external/hnswlib"]
-	path = external/hnswlib
-	url = https://github.com/nmslib/hnswlib.git
 [submodule "external/message-queue"]
 	path = external/message-queue
 	url = git@github.com:niklas-uhl/message-queue.git

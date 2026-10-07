@@ -216,25 +216,6 @@ static void AllToAllV(const std::vector<std::vector<T>>& send_bufs,
         recv_bufs[r].assign(rf.begin() + rd[r], rf.begin() + rd[r] + rc[r]);
 }
 
-// Byte size hnswlib's saveIndex produces for `h` (mirrors its on-disk format),
-// used to detect short writes, e.g. from a full disk.
-static uintmax_t ExpectedHnswFileSize(const hnswlib::HierarchicalNSW<float>& h) {
-    uintmax_t n = sizeof(h.offsetLevel0_) + sizeof(h.max_elements_)
-                + sizeof(h.cur_element_count) + sizeof(h.size_data_per_element_)
-                + sizeof(h.label_offset_) + sizeof(h.offsetData_)
-                + sizeof(h.maxlevel_) + sizeof(h.enterpoint_node_)
-                + sizeof(h.maxM_) + sizeof(h.maxM0_) + sizeof(h.M_)
-                + sizeof(h.mult_) + sizeof(h.ef_construction_);
-    const size_t count = h.cur_element_count;
-    n += uintmax_t(count) * h.size_data_per_element_;
-    for (size_t i = 0; i < count; ++i) {
-        n += sizeof(unsigned int);
-        if (h.element_levels_[i] > 0)
-            n += uintmax_t(h.size_links_per_element_) * h.element_levels_[i];
-    }
-    return n;
-}
-
 // Byte size WriteMetisPartition produces for `partition`.
 static uintmax_t ExpectedPartitionFileSize(const std::vector<int>& partition) {
     uintmax_t n = 0;
@@ -275,6 +256,9 @@ public:
     // queries — QPS is reported over that scaled count — while recall and
     // theoretical recall are computed once over the original query set + GT.
     double search_scale = 1.0;
+    // --reuse: inserts refill slots freed by deletes (allow_replace_deleted)
+    // instead of always appending.
+    bool reuse_slots = false;
 
     // Per-shard size information gathered from all ranks.
     // slots  = cur_element_count  (total graph nodes, including deleted)
@@ -371,12 +355,12 @@ public:
             if (ok && local_hnsw) {
                 const std::string f = dir + "/shard_" + std::to_string(rank) + ".hnsw";
                 local_hnsw->saveIndex(f);
-                ok &= FileHasSize(f, ExpectedHnswFileSize(*local_hnsw));
+                ok &= FileHasSize(f, local_hnsw->indexFileSize());
             }
             if (ok && router) {
                 const std::string f = dir + "/router_" + std::to_string(rank) + ".hnsw";
                 router->Serialize(f);
-                ok &= FileHasSize(f, ExpectedHnswFileSize(*router->hnsw));
+                ok &= FileHasSize(f, router->hnsw->indexFileSize());
                 ok &= FileHasSize(f + ".routing_index_partition",
                                   ExpectedPartitionFileSize(router->partition));
             }
@@ -407,7 +391,8 @@ public:
                          << "max_pts "              << max_pts              << "\n"
                          << "num_neighbors "        << num_neighbors        << "\n"
                          << "num_voting_neighbors " << num_voting_neighbors << "\n"
-                         << "search_scale "         << search_scale         << "\n";
+                         << "search_scale "         << search_scale         << "\n"
+                         << "reuse_slots "          << reuse_slots          << "\n";
                     meta.close();
                     ok &= static_cast<bool>(meta);
                 }
@@ -446,6 +431,7 @@ public:
                 else if (key == "num_neighbors")        meta >> num_neighbors;
                 else if (key == "num_voting_neighbors") meta >> num_voting_neighbors;
                 else if (key == "search_scale")         meta >> search_scale;
+                else if (key == "reuse_slots")          meta >> reuse_slots;
                 else if (key == "num_shards") {
                     int v; meta >> v;
                     if (v != num_shards)
@@ -472,7 +458,7 @@ public:
         // max_elements = 0 -> keep the capacity saved in the index; subsequent
         // ProcessInserts auto-resize if a later batch overflows it.
         local_hnsw = std::make_unique<hnswlib::HierarchicalNSW<float>>(
-            space.get(), shard_path);
+            space.get(), shard_path, false, 0, reuse_slots);
         local_hnsw->setEf(200);   // matches BuildInitial's local search ef
 
         // --- this rank's router (HNSW + companion routing partition) ---
@@ -565,14 +551,14 @@ public:
                                             (size_t)(ratio * max_pts) + 1);
 
         local_hnsw = std::make_unique<hnswlib::HierarchicalNSW<float>>(
-            space.get(), capacity, 16, 200, 555 + rank);
+            space.get(), capacity, 16, 200, 555 + rank, reuse_slots);
         local_hnsw->setEf(200);
 
         const auto& my_cluster = clusters[rank];
         parlay::parallel_for(0, my_cluster.size(), [&](size_t i) {
             uint32_t id = my_cluster[i];
             float* p = init.GetPoint(id - batch_start);
-            local_hnsw->addPoint(p, id);
+            local_hnsw->addPoint(p, id, reuse_slots);
         });
 
         if (rank == 0)
@@ -624,7 +610,7 @@ public:
             }
         }
         parlay::parallel_for(0, ins_ids.size(), [&](size_t i) {
-            local_hnsw->addPoint(ins_ptrs[i], ins_ids[i]);
+            local_hnsw->addPoint(ins_ptrs[i], ins_ids[i], reuse_slots);
         });
 
         const double elapsed = MPI_Wtime() - t0;
@@ -657,17 +643,32 @@ public:
     // -----------------------------------------------------------------------
     double ProcessDeletes(uint32_t start, uint32_t end) {
         // label_to_shard is consistent on all ranks (kept in sync by
-        // MPI_Allgatherv in ProcessInserts).  Each rank directly marks only
-        // the labels it owns — no AlltoAllv needed.
+        // MPI_Allgatherv in ProcessInserts).  Each rank deletes only the labels
+        // it owns — no AlltoAllv needed.
+        //
+        // Wolverine physical delete + edge repair, with surge's defaults
+        // (Executor::patch_delete_local_batch): two-hop repair, newLinkSize = M,
+        // num_threads = -1 (all hardware threads).  One call per op: each call
+        // scans the whole shard.
         MPI_Barrier(MPI_COMM_WORLD);
         const double t0 = MPI_Wtime();
 
+        std::vector<hnswlib::labeltype> mine;
         for (uint32_t id = start; id < end; ++id) {
             auto it = label_to_shard.find(id);
             if (it == label_to_shard.end()) continue;
-            if (it->second == rank)
-                local_hnsw->markDelete(id);
+            if (it->second == rank) mine.push_back(id);
             label_to_shard.erase(it);
+        }
+        try {
+            local_hnsw->patchDelete(mine,
+                hnswlib::HierarchicalNSW<float>::TWOHOP_DELETE,
+                static_cast<int>(local_hnsw->M_), /*num_threads=*/-1);
+        } catch (const std::exception& e) {
+            // A failed patchDelete leaves the shard partially repaired.
+            std::cerr << "ERROR (rank " << rank << "): patchDelete ["
+                      << start << ", " << end << ") failed: " << e.what() << "\n";
+            MPI_Abort(MPI_COMM_WORLD, 1);
         }
 
         const double elapsed = MPI_Wtime() - t0;
@@ -956,7 +957,12 @@ int main(int argc, const char* argv[]) {
                 " <base.fbin> <queries.fbin> <partition-file>"
                 " <gt-prefix> <runbook.yaml>"
                 " <num-neighbors> [output-file]"
-                " [--search-scale <f> | --search-fraction <p>] [--resume <dir>]\n"
+                " [--search-scale <f> | --search-fraction <p>] [--resume <dir>]"
+                " [--reuse]\n"
+                "\n"
+                "  --reuse         inserts reuse slots freed by deletes instead of\n"
+                "                  appending (default: off).  A resumed run keeps the\n"
+                "                  setting stored in its checkpoint.\n"
                 "\n"
                 "  --resume <dir>  resume from a checkpoint directory written under\n"
                 "                  $HOME/extra (e.g. .../checkpoint_step000050): the\n"
@@ -985,6 +991,7 @@ int main(int argc, const char* argv[]) {
     // flags, in any order.
     std::string output_file        = "sweep_results.csv";
     std::string resume_dir;                  // --resume (empty = fresh run)
+    bool        reuse_slots         = false; // --reuse
     double      search_scale_arg    = 1.0;   // --search-scale
     double      search_fraction_arg = -1.0;  // --search-fraction (<0 = unset)
     for (int ai = 7; ai < argc; ++ai) {
@@ -995,6 +1002,8 @@ int main(int argc, const char* argv[]) {
             search_fraction_arg = std::stod(argv[++ai]);
         } else if (a == "--resume" && ai + 1 < argc) {
             resume_dir = argv[++ai];
+        } else if (a == "--reuse") {
+            reuse_slots = true;
         } else if (!a.empty() && a[0] != '-') {
             output_file = a;                 // positional output file
         } else {
@@ -1019,7 +1028,9 @@ int main(int argc, const char* argv[]) {
                   << "max_pts : " << rb.max_pts << "\n"
                   << "ops     : " << rb.ops.size() << "\n"
                   << "shards  : " << comm_size << "\n"
-                  << "output  : " << output_file << "\n\n";
+                  << "output  : " << output_file << "\n"
+                  << "deletes : wolverine (patchDelete, two-hop repair)\n"
+                  << "reuse   : " << (reuse_slots ? "on" : "off") << "\n\n";
 
     // Open CSV on rank 0 in APPEND mode so a rerun (or a --resume continuation)
     // never truncates existing results.  The header is written only when the
@@ -1056,6 +1067,7 @@ int main(int argc, const char* argv[]) {
 
     DistributedInsertBenchmark bench;
     bench.num_neighbors       = num_neighbors;
+    bench.reuse_slots         = reuse_slots;
     // num_voting_neighbors = 3*num_shards so every shard gets a real distance
     // estimate regardless of which nprobe value we're sweeping.
     bench.num_voting_neighbors = 10*comm_size;
@@ -1118,7 +1130,7 @@ int main(int argc, const char* argv[]) {
     // ── Resume from a checkpoint, if requested ───────────────────────────────
     // Load the saved index/router/metadata instead of building, and continue the
     // runbook from the op recorded in the checkpoint.  LoadCheckpoint overrides
-    // dim / num_neighbors / num_voting_neighbors / search_scale with the values
+    // dim / num_neighbors / num_voting_neighbors / search_scale / reuse_slots with the values
     // the original run used, so the continuation stays consistent.
     if (!resume_dir.empty()) {
         if (rank == 0)
@@ -1140,7 +1152,8 @@ int main(int argc, const char* argv[]) {
             std::cout << "  resumed at op " << start_op << " / " << rb.ops.size()
                       << "  (dim=" << bench.dim
                       << ", num_neighbors=" << bench.num_neighbors
-                      << ", search_scale=" << bench.search_scale << ")\n\n";
+                      << ", search_scale=" << bench.search_scale
+                      << ", reuse=" << (bench.reuse_slots ? "on" : "off") << ")\n\n";
     }
 
     for (size_t op_idx = start_op; op_idx < rb.ops.size(); ++op_idx) {
