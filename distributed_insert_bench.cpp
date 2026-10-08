@@ -34,9 +34,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -164,24 +166,53 @@ template<typename T>
 static void AllToAllV(const std::vector<std::vector<T>>& send_bufs,
                       std::vector<std::vector<T>>&       recv_bufs,
                       MPI_Datatype                       dtype,
-                      int comm_size, MPI_Comm comm) {
-    std::vector<int> sc(comm_size), sd(comm_size, 0);
-    for (int r = 0; r < comm_size; ++r) sc[r] = (int)send_bufs[r].size();
-    for (int r = 1; r < comm_size; ++r) sd[r] = sd[r-1] + sc[r-1];
+                      int comm_size, MPI_Comm comm,
+                      int item_len = 1) {
+    // MPI counts and displacements are int. Exchanging items of item_len
+    // consecutive elements (e.g. one vector of dim floats) keeps them in item
+    // units, so multi-GB exchanges stay far below INT_MAX.
+    auto to_int = [](size_t v) {
+        if (v > (size_t)std::numeric_limits<int>::max())
+            throw std::runtime_error("AllToAllV: more than INT_MAX items in one exchange");
+        return (int)v;
+    };
+    MPI_Datatype item_t = dtype;
+    if (item_len > 1) {
+        MPI_Type_contiguous(item_len, dtype, &item_t);
+        MPI_Type_commit(&item_t);
+    }
+
+    std::vector<int> sc(comm_size), sd(comm_size);
+    size_t send_items = 0;
+    for (int r = 0; r < comm_size; ++r) {
+        if (send_bufs[r].size() % item_len != 0)
+            throw std::runtime_error("AllToAllV: buffer size is not a multiple of item_len");
+        sd[r] = to_int(send_items);
+        sc[r] = to_int(send_bufs[r].size() / item_len);
+        send_items += (size_t)sc[r];
+    }
     std::vector<T> sf;
-    { size_t tot = 0; for (auto& b : send_bufs) tot += b.size(); sf.reserve(tot); }
+    sf.reserve(send_items * item_len);
     for (int r = 0; r < comm_size; ++r)
         sf.insert(sf.end(), send_bufs[r].begin(), send_bufs[r].end());
 
-    std::vector<int> rc(comm_size, 0), rd(comm_size, 0);
+    std::vector<int> rc(comm_size, 0), rd(comm_size);
     MPI_Alltoall(sc.data(), 1, MPI_INT, rc.data(), 1, MPI_INT, comm);
-    for (int r = 1; r < comm_size; ++r) rd[r] = rd[r-1] + rc[r-1];
-    std::vector<T> rf(rd.back() + rc.back());
-    MPI_Alltoallv(sf.data(), sc.data(), sd.data(), dtype,
-                  rf.data(), rc.data(), rd.data(), dtype, comm);
+    size_t recv_items = 0;
+    for (int r = 0; r < comm_size; ++r) {
+        rd[r] = to_int(recv_items);
+        recv_items += (size_t)rc[r];
+    }
+    std::vector<T> rf(recv_items * item_len);
+    MPI_Alltoallv(sf.data(), sc.data(), sd.data(), item_t,
+                  rf.data(), rc.data(), rd.data(), item_t, comm);
+    if (item_len > 1) MPI_Type_free(&item_t);
+
     recv_bufs.assign(comm_size, {});
-    for (int r = 0; r < comm_size; ++r)
-        recv_bufs[r].assign(rf.begin() + rd[r], rf.begin() + rd[r] + rc[r]);
+    for (int r = 0; r < comm_size; ++r) {
+        auto first = rf.begin() + (size_t)rd[r] * item_len;
+        recv_bufs[r].assign(first, first + (size_t)rc[r] * item_len);
+    }
 }
 
 
@@ -342,7 +373,7 @@ public:
         std::vector<std::vector<uint32_t>> recv_ids;
         std::vector<std::vector<float>>    recv_vecs;
         AllToAllV(send_ids,  recv_ids,  MPI_UINT32_T, comm_size, MPI_COMM_WORLD);
-        AllToAllV(send_vecs, recv_vecs, MPI_FLOAT,    comm_size, MPI_COMM_WORLD);
+        AllToAllV(send_vecs, recv_vecs, MPI_FLOAT,    comm_size, MPI_COMM_WORLD, dim);
 
         // Flatten received vectors; pre-resize once before parallel addPoint.
         std::vector<uint32_t> ins_ids;
@@ -451,7 +482,7 @@ public:
         std::vector<std::vector<uint32_t>> recv_qids;
         std::vector<std::vector<float>>    recv_qvecs;
         AllToAllV(send_qids,  recv_qids,  MPI_UINT32_T, comm_size, MPI_COMM_WORLD);
-        AllToAllV(send_qvecs, recv_qvecs, MPI_FLOAT,    comm_size, MPI_COMM_WORLD);
+        AllToAllV(send_qvecs, recv_qvecs, MPI_FLOAT,    comm_size, MPI_COMM_WORLD, dim);
 
         // Flatten received queries; run searchKnn in parallel; repack results.
         struct QTask { int src; size_t j; uint32_t qid; };
