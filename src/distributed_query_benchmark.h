@@ -114,6 +114,11 @@ public:
     // -----------------------------------------------------------------------
     // Load only the shard-local vectors, converting .u8bin/.i8bin/.fbin
     // to float32. Populates shard_point_ids[local_idx] = global_point_id.
+    //
+    // Accepts either the full point file (or a sparse copy of it), read by
+    // seeking to this rank's points, or a compact shard file written by
+    // shard_fanout.py --compact: only this rank's points, in ascending global
+    // id order, with header n equal to this rank's point count.
     // -----------------------------------------------------------------------
     void LoadShardPointSet(const std::string& point_set_file) {
         const bool is_float = point_set_file.ends_with(".fbin");
@@ -128,6 +133,64 @@ public:
         if (!in) throw std::runtime_error("Cannot open point file: " + point_set_file);
         in.read(reinterpret_cast<char*>(&n), sizeof(uint32_t));
         in.read(reinterpret_cast<char*>(&d), sizeof(uint32_t));
+
+        // Reads `count` elements at the current file position into
+        // shard_points.coordinates[dst ...], converting to float in bounded chunks.
+        auto read_coords = [&](size_t count, size_t dst) {
+            constexpr size_t kChunk = size_t(1) << 24;
+            std::vector<char> buf;
+            for (size_t done = 0; done < count;) {
+                const size_t m = std::min(kChunk, count - done);
+                float* out = &shard_points.coordinates[dst + done];
+                if (is_float) {
+                    in.read(reinterpret_cast<char*>(out), m * sizeof(float));
+                } else {
+                    buf.resize(m);
+                    in.read(buf.data(), m);
+                    if (is_u8)
+                        for (size_t k = 0; k < m; ++k)
+                            out[k] = static_cast<float>(static_cast<uint8_t>(buf[k]));
+                    else
+                        for (size_t k = 0; k < m; ++k)
+                            out[k] = static_cast<float>(static_cast<int8_t>(buf[k]));
+                }
+                if (!in) throw std::runtime_error("Short read from point file: " + point_set_file);
+                done += m;
+            }
+        };
+
+        size_t rank_points = 0;
+        for (int s : partition)
+            if (s == rank) ++rank_points;
+
+        // With a single shard the full file and a compact file are identical, so
+        // treating it as compact is still correct.
+        if (n == rank_points) {
+            const size_t expected = header_bytes + (size_t)n * d * elem_bytes;
+            if (std::filesystem::file_size(point_set_file) != expected)
+                throw std::runtime_error("Compact shard file has wrong size: " + point_set_file);
+
+            shard_points.n = n;
+            shard_points.d = d;
+            shard_points.coordinates.resize((size_t)n * d);
+            dim = (int)d;
+
+            shard_point_ids.clear();
+            shard_point_ids.reserve(n);
+            for (size_t i = 0; i < partition.size(); ++i)
+                if (partition[i] == rank) shard_point_ids.push_back((uint32_t)i);
+
+            read_coords((size_t)n * d, 0);
+            std::cerr << "[rank " << rank << "] LoadShardPointSet (compact): "
+                      << shard_points.n << " points, dim=" << dim << "\n";
+            return;
+        }
+
+        if ((size_t)n < partition.size())
+            throw std::runtime_error(
+                "Point file " + point_set_file + " has " + std::to_string(n) +
+                " points but the partition covers " + std::to_string(partition.size()) +
+                "; a compact shard file here belongs to a different rank or partition");
 
         // Count how many points belong to this rank
         size_t num_points_in_shard = 0;
@@ -161,25 +224,7 @@ public:
             --point_id; // outer for-loop will increment
 
             in.seekg((std::streamoff)file_offset);
-            if (is_float) {
-                in.read(reinterpret_cast<char*>(
-                            &shard_points.coordinates[coords_end]),
-                        range_length * d * sizeof(float));
-            } else if (is_u8) {
-                std::vector<uint8_t> buf(range_length * d);
-                in.read(reinterpret_cast<char*>(buf.data()),
-                        range_length * d * sizeof(uint8_t));
-                for (size_t k = 0; k < buf.size(); ++k)
-                    shard_points.coordinates[coords_end + k] =
-                        static_cast<float>(buf[k]);
-            } else { // i8
-                std::vector<int8_t> buf(range_length * d);
-                in.read(reinterpret_cast<char*>(buf.data()),
-                        range_length * d * sizeof(int8_t));
-                for (size_t k = 0; k < buf.size(); ++k)
-                    shard_points.coordinates[coords_end + k] =
-                        static_cast<float>(buf[k]);
-            }
+            read_coords(range_length * d, coords_end);
             coords_end += range_length * d;
         }
 
