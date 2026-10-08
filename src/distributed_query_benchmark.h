@@ -170,17 +170,22 @@ public:
             if (std::filesystem::file_size(point_set_file) != expected)
                 throw std::runtime_error("Compact shard file has wrong size: " + point_set_file);
 
-            shard_points.n = n;
-            shard_points.d = d;
-            shard_points.coordinates.resize((size_t)n * d);
-            dim = (int)d;
-
             shard_point_ids.clear();
             shard_point_ids.reserve(n);
             for (size_t i = 0; i < partition.size(); ++i)
                 if (partition[i] == rank) shard_point_ids.push_back((uint32_t)i);
 
-            read_coords((size_t)n * d, 0);
+            dim = (int)d;
+            if (is_u8) {
+                // Map the bytes instead of expanding them to float: GetPoint converts
+                // one point at a time, so only the HNSW index holds float vectors.
+                shard_points = ReadU8BinMmap(point_set_file);
+            } else {
+                shard_points.n = n;
+                shard_points.d = d;
+                shard_points.coordinates.resize((size_t)n * d);
+                read_coords((size_t)n * d, 0);
+            }
             std::cerr << "[rank " << rank << "] LoadShardPointSet (compact): "
                       << shard_points.n << " points, dim=" << dim << "\n";
             return;
